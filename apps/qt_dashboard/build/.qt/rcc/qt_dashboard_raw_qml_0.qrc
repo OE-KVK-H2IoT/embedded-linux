@@ -1,0 +1,7 @@
+<RCC>
+  <qresource prefix="/Dashboard/">
+    <file alias="Main.qml">/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/Main.qml</file>
+    <file alias="GaugeArc.qml">/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/GaugeArc.qml</file>
+  </qresource>
+</RCC>
+

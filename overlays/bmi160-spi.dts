@@ -1,0 +1,33 @@
+/*
+ * Device Tree Overlay for BMI160 IMU on SPI0, CS0 (Raspberry Pi)
+ *
+ * Compile:
+ *   dtc -@ -I dts -O dtb -o bmi160-spi.dtbo bmi160-spi.dts
+ *
+ * Install:
+ *   sudo cp bmi160-spi.dtbo /boot/overlays/
+ *   Add to /boot/config.txt:  dtoverlay=bmi160-spi
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&spi0>;
+		__overlay__ {
+			status = "okay";
+
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			bmi160@0 {
+				compatible = "bosch,bmi160";
+				reg = <0>;              /* CS0 */
+				spi-max-frequency = <10000000>;  /* 10 MHz */
+			};
+		};
+	};
+};

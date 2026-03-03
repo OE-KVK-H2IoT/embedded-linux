@@ -1,0 +1,15 @@
+--bare
+-I
+/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build
+-I
+/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build/Dashboard
+-I
+/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build
+-I
+/usr/lib/qt6/qml
+--resource
+/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build/.qt/rcc/qmake_Dashboard.qrc
+--resource
+/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build/.qt/rcc/qt_dashboard_raw_qml_0.qrc
+/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/Main.qml
+/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/GaugeArc.qml

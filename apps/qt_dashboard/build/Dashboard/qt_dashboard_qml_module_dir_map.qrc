@@ -1,0 +1,6 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="/Dashboard">/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build/Dashboard</file>
+
+  </qresource>
+</RCC>

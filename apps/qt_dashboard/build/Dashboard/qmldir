@@ -1,0 +1,7 @@
+module Dashboard
+typeinfo qt_dashboard.qmltypes
+prefer :/Dashboard/
+Main 1.0 Main.qml
+GaugeArc 1.0 GaugeArc.qml
+depends QtQuick
+
