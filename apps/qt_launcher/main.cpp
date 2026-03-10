@@ -30,8 +30,11 @@
 #include <QNetworkInterface>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
-#include <xf86drm.h>    /* drmDropMaster / drmSetMaster */
+#include <fcntl.h>
+#include <unistd.h>
+#include <xf86drm.h>    /* drmDropMaster / drmSetMaster / drmGetVersion */
 
 /* ── LaunchManager ──────────────────────────────────────────── */
 
@@ -105,29 +108,38 @@ private:
      *
      * DRM master is tracked per open file-descriptor, not per process.
      * EGLFS opens /dev/dri/cardN internally and we cannot access that
-     * fd through public Qt API.  Instead we scan /proc/self/fd/ to
-     * find every fd that points to a DRM card device and call
-     * drmDropMaster() on the EGLFS-held fd directly.
+     * fd through public Qt API.
      *
-     * We do NOT close the fd — it belongs to EGLFS.  We just
-     * temporarily relinquish master status.
+     * Strategy: iterate over all open fds (3..max) and probe each with
+     * drmGetVersion() — if it succeeds, the fd is a DRM device.
+     * Then call drmDropMaster() on it.  We do NOT close the fd.
      */
     void dropDrmMaster() {
-        QDir fdDir("/proc/self/fd");
-        for (const QString &entry : fdDir.entryList(QDir::NoDotAndDotDot)) {
-            QString target = QFile::symLinkTarget(fdDir.filePath(entry));
-            if (target.startsWith("/dev/dri/card")) {
-                int fd = entry.toInt();
-                int ret = drmDropMaster(fd);
-                qDebug("dropDrmMaster: fd=%d (%s) → %s",
-                       fd, qPrintable(target),
-                       ret == 0 ? "OK" : strerror(errno));
-                if (ret == 0)
-                    m_drmFds.append(fd);
-            }
+        int maxFd = (int)sysconf(_SC_OPEN_MAX);
+        if (maxFd < 0 || maxFd > 4096) maxFd = 4096;
+
+        fprintf(stderr, "[launcher] dropDrmMaster: scanning fds 3..%d\n", maxFd);
+
+        for (int fd = 3; fd < maxFd; ++fd) {
+            /* Quick check: is fd valid? */
+            if (fcntl(fd, F_GETFD) == -1) continue;
+
+            drmVersionPtr ver = drmGetVersion(fd);
+            if (!ver) continue;
+
+            fprintf(stderr, "[launcher]   fd=%d is DRM device: %s\n",
+                    fd, ver->name);
+            drmFreeVersion(ver);
+
+            int ret = drmDropMaster(fd);
+            fprintf(stderr, "[launcher]   drmDropMaster(fd=%d) → %s\n",
+                    fd, ret == 0 ? "OK" : strerror(errno));
+            if (ret == 0)
+                m_drmFds.append(fd);
         }
+
         if (m_drmFds.isEmpty())
-            qWarning("dropDrmMaster: no DRM fds found!");
+            fprintf(stderr, "[launcher] dropDrmMaster: NO DRM fds found!\n");
     }
 
     /*
@@ -137,8 +149,8 @@ private:
     void acquireDrmMaster() {
         for (int fd : m_drmFds) {
             int ret = drmSetMaster(fd);
-            qDebug("acquireDrmMaster: fd=%d → %s",
-                   fd, ret == 0 ? "OK" : strerror(errno));
+            fprintf(stderr, "[launcher] drmSetMaster(fd=%d) → %s\n",
+                    fd, ret == 0 ? "OK" : strerror(errno));
         }
         m_drmFds.clear();
     }
