@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# kiosk-select — switch between display kiosk services
+# Usage: sudo kiosk-select <app>
+#   app: level-sdl2 | sdl2-dashboard | level-display-py | none
+
+set -euo pipefail
+
+SERVICES=(level-sdl2 sdl2-dashboard level-display-py)
+
+usage() {
+    echo "Usage: sudo kiosk-select <app>"
+    echo ""
+    echo "Apps:"
+    echo "  level-sdl2        Level display (SDL2 + DRM/KMS)"
+    echo "  sdl2-dashboard    Multi-gauge dashboard (SDL2 + DRM/KMS)"
+    echo "  level-display-py  Level display (Python + framebuffer)"
+    echo "  none              Disable all display services"
+    echo ""
+    show_status
+}
+
+show_status() {
+    echo "Current state:"
+    for svc in "${SERVICES[@]}"; do
+        local enabled active
+        enabled=$(systemctl is-enabled "${svc}.service" 2>/dev/null || true)
+        active=$(systemctl is-active "${svc}.service" 2>/dev/null || true)
+        printf "  %-20s enabled=%-8s active=%s\n" "${svc}" "${enabled}" "${active}"
+    done
+}
+
+disable_all() {
+    for svc in "${SERVICES[@]}"; do
+        systemctl disable --now "${svc}.service" 2>/dev/null || true
+    done
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
+    exit 0
+fi
+
+APP="$1"
+
+if [[ "${APP}" == "none" ]]; then
+    disable_all
+    echo "All display services disabled."
+    exit 0
+fi
+
+# Validate app name
+valid=false
+for svc in "${SERVICES[@]}"; do
+    if [[ "${svc}" == "${APP}" ]]; then
+        valid=true
+        break
+    fi
+done
+
+if [[ "${valid}" != "true" ]]; then
+    echo "Error: unknown app '${APP}'"
+    echo ""
+    usage
+    exit 1
+fi
+
+disable_all
+systemctl enable --now "${APP}.service"
+echo "Switched to ${APP}."
+show_status

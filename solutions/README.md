@@ -16,6 +16,13 @@ solutions/
 ├── drm-kms-test/
 │   └── task_c_pipeline.sh        # Task C: Explore the Pipeline
 │
+├── sdl2-rotating-cube/
+│   ├── CMakeLists.txt              # Builds all four steps as separate targets
+│   ├── step1_triangle.c            # Step 1: Static rainbow triangle
+│   ├── step2_square.c              # Step 2: Indexed square (two triangles)
+│   ├── step3_rotating_square.c     # Step 3: Rotating square with Y-axis matrix
+│   └── step4_cube.c                # Step 4: Full 3D rotating cube
+│
 └── spi-display/
     ├── challenge1_partial.py     # Challenge 1: Partial Updates
     ├── challenge3_bandwidth.py   # Challenge 3: Bandwidth Calculation

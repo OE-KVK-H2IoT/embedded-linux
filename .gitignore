@@ -7,3 +7,5 @@ __pycache__/
 modules.order
 Module.symvers
 .tmp_versions/
+build/
+*.bin

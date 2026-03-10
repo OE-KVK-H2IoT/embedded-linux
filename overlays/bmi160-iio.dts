@@ -1,0 +1,53 @@
+/*
+ * bmi160-iio.dts — Device Tree overlay for BMI160 using mainline IIO driver
+ *
+ * This overlay uses "bosch,bmi160" (with vendor prefix) to bind the
+ * mainline kernel IIO driver (drivers/iio/imu/bmi160/).
+ *
+ * Compare with bmi160-spi.dts which uses "bmi160" (no vendor prefix)
+ * for the custom teaching driver.
+ *
+ * Usage:
+ *   dtc -@ -I dts -O dtb -o bmi160-iio.dtbo bmi160-iio.dts
+ *   sudo cp bmi160-iio.dtbo /boot/firmware/overlays/
+ *   # Add to /boot/firmware/config.txt: dtoverlay=bmi160-iio
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&spidev0>;
+
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@1 {
+		target = <&spi0>;
+
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			bmi160@0 {
+				compatible = "bosch,bmi160";
+				reg = <0>;
+				spi-max-frequency = <10000000>;
+
+				/*
+				 * Optional: data-ready interrupt for IIO trigger
+				 * Connect BMI160 INT1 pin to RPi GPIO 25 (pin 22)
+				 *
+				 * interrupt-parent = <&gpio>;
+				 * interrupts = <25 1>;  // rising edge
+				 */
+			};
+		};
+	};
+};

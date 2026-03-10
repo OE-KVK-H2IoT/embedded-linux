@@ -1,6 +1,0 @@
---resource
-/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build/.qt/rcc/qmake_Dashboard.qrc
---resource
-/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build/.qt/rcc/qt_dashboard_raw_qml_0.qrc
-/Dashboard/Main.qml
-/Dashboard/GaugeArc.qml

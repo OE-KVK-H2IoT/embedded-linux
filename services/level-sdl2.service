@@ -1,0 +1,17 @@
+[Unit]
+Description=Level Display (SDL2 + DRM/KMS)
+After=multi-user.target
+Conflicts=sdl2-dashboard.service level-display-py.service
+
+[Service]
+Type=simple
+ExecStart=/home/pi/embedded-linux/apps/level_sdl2
+Environment=SDL_VIDEODRIVER=kmsdrm
+Restart=on-failure
+RestartSec=3
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,1 +1,0 @@
-/home/user/Work/docs/es101/src/linux/apps/qt_dashboard/build/qt_dashboard_autogen/include/main.moc.json

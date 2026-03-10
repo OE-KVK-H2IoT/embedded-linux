@@ -1,0 +1,50 @@
+/*
+ * fpga-adc-spi.dts — Device Tree overlay for FPGA ADC (MCP3008-compatible)
+ *
+ * Binds the fpga_adc_iio driver to SPI0 chip select 1.
+ * CS0 is typically used by the BMI160 — this uses CS1 for the ADC.
+ *
+ * Usage:
+ *   dtc -@ -I dts -O dtb -o fpga-adc-spi.dtbo fpga-adc-spi.dts
+ *   sudo cp fpga-adc-spi.dtbo /boot/firmware/overlays/
+ *   # Add to /boot/firmware/config.txt: dtoverlay=fpga-adc-spi
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	fragment@0 {
+		target = <&spidev1>;
+
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@1 {
+		target = <&spi0>;
+
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			fpga_adc@1 {
+				compatible = "custom,fpga-adc";
+				reg = <1>;                       /* SPI CS1 */
+				spi-max-frequency = <1000000>;   /* 1 MHz */
+
+				/*
+				 * Optional: data-ready interrupt
+				 * Connect ADC DRDY pin to RPi GPIO 24 (pin 18)
+				 *
+				 * interrupt-parent = <&gpio>;
+				 * interrupts = <24 1>;
+				 */
+			};
+		};
+	};
+};
