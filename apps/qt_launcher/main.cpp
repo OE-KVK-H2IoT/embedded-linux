@@ -118,38 +118,28 @@ private:
         int maxFd = (int)sysconf(_SC_OPEN_MAX);
         if (maxFd < 0 || maxFd > 4096) maxFd = 4096;
 
-        fprintf(stderr, "[launcher] dropDrmMaster: scanning fds 3..%d\n", maxFd);
-
         for (int fd = 3; fd < maxFd; ++fd) {
-            /* Quick check: is fd valid? */
             if (fcntl(fd, F_GETFD) == -1) continue;
 
             drmVersionPtr ver = drmGetVersion(fd);
             if (!ver) continue;
-
-            fprintf(stderr, "[launcher]   fd=%d is DRM device: %s\n",
-                    fd, ver->name);
             drmFreeVersion(ver);
 
-            int ret = drmDropMaster(fd);
-            fprintf(stderr, "[launcher]   drmDropMaster(fd=%d) → %s\n",
-                    fd, ret == 0 ? "OK" : strerror(errno));
-            if (ret == 0)
+            /* Try to drop — only the master fd will succeed */
+            if (drmDropMaster(fd) == 0) {
+                fprintf(stderr, "[launcher] drmDropMaster(fd=%d): OK\n", fd);
                 m_drmFds.append(fd);
+            }
         }
 
         if (m_drmFds.isEmpty())
-            fprintf(stderr, "[launcher] dropDrmMaster: NO DRM fds found!\n");
+            fprintf(stderr, "[launcher] dropDrmMaster: no master fd found!\n");
     }
 
-    /*
-     * Re-acquire DRM master on the fds we previously dropped.
-     * EGLFS will resume rendering after the window is shown.
-     */
     void acquireDrmMaster() {
         for (int fd : m_drmFds) {
             int ret = drmSetMaster(fd);
-            fprintf(stderr, "[launcher] drmSetMaster(fd=%d) → %s\n",
+            fprintf(stderr, "[launcher] drmSetMaster(fd=%d): %s\n",
                     fd, ret == 0 ? "OK" : strerror(errno));
         }
         m_drmFds.clear();
