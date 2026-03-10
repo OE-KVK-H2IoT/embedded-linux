@@ -29,6 +29,8 @@
 #include <QWindow>
 #include <QNetworkInterface>
 
+#include <cerrno>
+#include <cstring>
 #include <xf86drm.h>    /* drmDropMaster / drmSetMaster */
 
 /* ── LaunchManager ──────────────────────────────────────────── */
@@ -116,10 +118,16 @@ private:
             QString target = QFile::symLinkTarget(fdDir.filePath(entry));
             if (target.startsWith("/dev/dri/card")) {
                 int fd = entry.toInt();
-                if (drmDropMaster(fd) == 0)
+                int ret = drmDropMaster(fd);
+                qDebug("dropDrmMaster: fd=%d (%s) → %s",
+                       fd, qPrintable(target),
+                       ret == 0 ? "OK" : strerror(errno));
+                if (ret == 0)
                     m_drmFds.append(fd);
             }
         }
+        if (m_drmFds.isEmpty())
+            qWarning("dropDrmMaster: no DRM fds found!");
     }
 
     /*
@@ -127,8 +135,11 @@ private:
      * EGLFS will resume rendering after the window is shown.
      */
     void acquireDrmMaster() {
-        for (int fd : m_drmFds)
-            drmSetMaster(fd);
+        for (int fd : m_drmFds) {
+            int ret = drmSetMaster(fd);
+            qDebug("acquireDrmMaster: fd=%d → %s",
+                   fd, ret == 0 ? "OK" : strerror(errno));
+        }
         m_drmFds.clear();
     }
 

@@ -92,7 +92,7 @@ Window {
                     icon: "\u2694"
                     label: "Doom"
                     accent: "#e05050"
-                    onClicked: launcher.launch("chocolate-doom -iwad /home/linux/doom1.wad")
+                    onClicked: launcher.launch(repo + "/solutions/doom-on-pi/doom_kiosk.sh")
                 }
 
                 AppButton {
