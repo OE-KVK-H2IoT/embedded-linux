@@ -29,6 +29,8 @@
 #include <QWindow>
 #include <QNetworkInterface>
 
+#include <xf86drm.h>    /* drmDropMaster / drmSetMaster */
+
 /* ── LaunchManager ──────────────────────────────────────────── */
 
 class LaunchManager : public QObject
@@ -48,8 +50,9 @@ public:
         m_childRunning = true;
         emit childRunningChanged();
 
-        /* Hide launcher window so child can claim DRM master */
+        /* Release the display so the child can claim DRM master */
         hideWindow();
+        dropDrmMaster();
 
         m_process = new QProcess(this);
         m_process->setProcessChannelMode(QProcess::ForwardedChannels);
@@ -65,6 +68,7 @@ public:
             emit childRunningChanged();
 
             /* Reclaim display */
+            acquireDrmMaster();
             showWindow();
             emit childFinished(code);
         });
@@ -94,7 +98,42 @@ private:
             w->show();
     }
 
+    /*
+     * Drop DRM master so the child process can claim the display.
+     *
+     * DRM master is tracked per open file-descriptor, not per process.
+     * EGLFS opens /dev/dri/cardN internally and we cannot access that
+     * fd through public Qt API.  Instead we scan /proc/self/fd/ to
+     * find every fd that points to a DRM card device and call
+     * drmDropMaster() on the EGLFS-held fd directly.
+     *
+     * We do NOT close the fd — it belongs to EGLFS.  We just
+     * temporarily relinquish master status.
+     */
+    void dropDrmMaster() {
+        QDir fdDir("/proc/self/fd");
+        for (const QString &entry : fdDir.entryList(QDir::NoDotAndDotDot)) {
+            QString target = QFile::symLinkTarget(fdDir.filePath(entry));
+            if (target.startsWith("/dev/dri/card")) {
+                int fd = entry.toInt();
+                if (drmDropMaster(fd) == 0)
+                    m_drmFds.append(fd);
+            }
+        }
+    }
+
+    /*
+     * Re-acquire DRM master on the fds we previously dropped.
+     * EGLFS will resume rendering after the window is shown.
+     */
+    void acquireDrmMaster() {
+        for (int fd : m_drmFds)
+            drmSetMaster(fd);
+        m_drmFds.clear();
+    }
+
     QProcess *m_process = nullptr;
+    QList<int> m_drmFds;
     bool m_childRunning = false;
 };
 

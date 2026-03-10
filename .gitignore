@@ -9,3 +9,10 @@ Module.symvers
 .tmp_versions/
 build/
 *.bin
+
+# Compiled app binaries (built via make/cmake)
+apps/level_sdl2
+apps/sdl2_dashboard
+apps/pong_fb
+apps/atomic_sensor
+apps/iio_capture

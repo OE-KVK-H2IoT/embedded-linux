@@ -6,12 +6,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Core Quick)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DRM REQUIRED IMPORTED_TARGET libdrm)
 
 qt_add_executable(qt_launcher main.cpp)
 
 target_link_libraries(qt_launcher PRIVATE
     Qt6::Core
     Qt6::Quick
+    PkgConfig::DRM
 )
 
 # Embed QML files into the binary

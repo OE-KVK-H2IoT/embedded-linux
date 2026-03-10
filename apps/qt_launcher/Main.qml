@@ -1,8 +1,11 @@
 /*
  * Main.qml - Car-style app launcher with swipeable pages
  *
- * Page 1: App grid — launch Doom, Dashboard, Level Display, etc.
- * Page 2: System info — CPU, memory, temperature, uptime, IP
+ * Page 1: Apps     — Doom, Qt Dashboard, Ball Balance, Pong
+ * Page 2: Demos    — SDL2 tutorial demos (Cube, Touch Paint, Level, etc.)
+ * Page 3: System   — CPU, memory, temperature, uptime, IP
+ *
+ * All app paths assume the embedded-linux repo is cloned to ~/embedded-linux.
  *
  * Copyright (C) 2025 Obuda University - Embedded Systems Lab
  * SPDX-License-Identifier: MIT
@@ -19,6 +22,9 @@ Window {
     color: "#19191e"
     title: "Launcher"
 
+    /* Base path — students clone embedded-linux into their home dir */
+    readonly property string repo: "/home/linux/embedded-linux"
+
     Item {
         focus: true
         Keys.onEscapePressed: Qt.quit()
@@ -32,14 +38,25 @@ Window {
         color: "#111115"
         z: 1
 
-        Text {
-            text: sysinfo.hostname
-            color: "#dcdcdc"
-            font.pixelSize: 18
-            font.bold: true
+        Row {
             anchors.verticalCenter: parent.verticalCenter
             anchors.left: parent.left
             anchors.leftMargin: 20
+            spacing: 16
+
+            Text {
+                text: sysinfo.hostname
+                color: "#dcdcdc"
+                font.pixelSize: 18
+                font.bold: true
+            }
+
+            Text {
+                text: ["\u2022 Apps", "\u2022 Demos", "\u2022 System"][swipe.currentIndex]
+                color: "#50b4ff"
+                font.pixelSize: 14
+                anchors.baseline: parent.children[0].baseline
+            }
         }
 
         Text {
@@ -60,7 +77,7 @@ Window {
         anchors.left: parent.left
         anchors.right: parent.right
 
-        /* ── Page 1: App Grid ──────────────────────────────── */
+        /* ── Page 1: Apps ────────────────────────────────────── */
         Item {
             GridLayout {
                 anchors.fill: parent
@@ -84,16 +101,7 @@ Window {
                     icon: "\u2299"
                     label: "Dashboard"
                     accent: "#50b4ff"
-                    onClicked: launcher.launch("/home/linux/apps/qt_dashboard/build/qt_dashboard")
-                }
-
-                AppButton {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    icon: "\u25CE"
-                    label: "Level"
-                    accent: "#00c878"
-                    onClicked: launcher.launch("/home/linux/apps/level_sdl2")
+                    onClicked: launcher.launch(repo + "/apps/qt_dashboard/build/qt_dashboard")
                 }
 
                 AppButton {
@@ -102,7 +110,7 @@ Window {
                     icon: "\u25C9"
                     label: "Ball Balance"
                     accent: "#ff9832"
-                    onClicked: launcher.launch("python3 /home/linux/apps/ball_detection.py")
+                    onClicked: launcher.launch("python3 /home/linux/ball_detect.py")
                 }
 
                 AppButton {
@@ -111,7 +119,27 @@ Window {
                     icon: "\u25A3"
                     label: "Pong"
                     accent: "#c878ff"
-                    onClicked: launcher.launch("/home/linux/apps/pong_fb")
+                    onClicked: launcher.launch(repo + "/apps/pong_fb")
+                }
+            }
+        }
+
+        /* ── Page 2: Demos ───────────────────────────────────── */
+        Item {
+            GridLayout {
+                anchors.fill: parent
+                anchors.margins: 20
+                columns: 3
+                rowSpacing: 12
+                columnSpacing: 12
+
+                AppButton {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    icon: "\u25F0"
+                    label: "3D Cube"
+                    accent: "#00c878"
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/solutions/sdl2-rotating-cube/build/step4_cube")
                 }
 
                 AppButton {
@@ -120,12 +148,48 @@ Window {
                     icon: "\u270E"
                     label: "Touch Paint"
                     accent: "#ffc832"
-                    onClicked: launcher.launch("/home/linux/apps/sdl2_touch_paint")
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/solutions/sdl2-touch-paint/build/sdl2_touch_paint")
+                }
+
+                AppButton {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    icon: "\u25CE"
+                    label: "Level"
+                    accent: "#50e0a0"
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/level_sdl2")
+                }
+
+                AppButton {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    icon: "\u2261"
+                    label: "SDL2 Dashboard"
+                    accent: "#50b4ff"
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/sdl2_dashboard")
+                }
+
+                AppButton {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    icon: "\u25B3"
+                    label: "Triangle"
+                    accent: "#ff6480"
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/solutions/sdl2-rotating-cube/build/step1_triangle")
+                }
+
+                AppButton {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    icon: "\u25A1"
+                    label: "Spinning Square"
+                    accent: "#c878ff"
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/solutions/sdl2-rotating-cube/build/step3_rotating_square")
                 }
             }
         }
 
-        /* ── Page 2: System Info ───────────────────────────── */
+        /* ── Page 3: System Info ─────────────────────────────── */
         Item {
             ColumnLayout {
                 anchors.fill: parent
