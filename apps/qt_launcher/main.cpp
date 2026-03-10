@@ -24,9 +24,11 @@
 #include <QTimer>
 #include <QProcess>
 #include <QFile>
+#include <QFont>
 #include <QTextStream>
 #include <QDir>
 #include <QWindow>
+#include <QSurfaceFormat>
 #include <QNetworkInterface>
 
 #include <cerrno>
@@ -285,7 +287,16 @@ int main(int argc, char *argv[])
     if (qgetenv("QT_QPA_PLATFORM").isEmpty())
         qputenv("QT_QPA_PLATFORM", "eglfs");
 
+    /* 24-bit color (avoids banding on 16-bit framebuffers) */
+    qputenv("QT_QPA_EGLFS_FORCE_888", "1");
+
+    /* 4x multisampling for smoother edges */
+    QSurfaceFormat fmt;
+    fmt.setSamples(4);
+    QSurfaceFormat::setDefaultFormat(fmt);
+
     QGuiApplication app(argc, argv);
+    app.setFont(QFont("Sans", 14));  /* ensure clean default font */
 
     LaunchManager launcher;
     SystemInfo sysinfo;

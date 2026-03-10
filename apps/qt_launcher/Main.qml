@@ -49,6 +49,7 @@ Window {
                 color: "#dcdcdc"
                 font.pixelSize: 18
                 font.bold: true
+                renderType: Text.NativeRendering
             }
 
             Text {
@@ -56,6 +57,7 @@ Window {
                 color: "#50b4ff"
                 font.pixelSize: 14
                 anchors.baseline: parent.children[0].baseline
+                renderType: Text.NativeRendering
             }
         }
 
@@ -63,6 +65,7 @@ Window {
             text: sysinfo.ipAddress
             color: "#808080"
             font.pixelSize: 14
+            renderType: Text.NativeRendering
             anchors.verticalCenter: parent.verticalCenter
             anchors.right: parent.right
             anchors.rightMargin: 20
@@ -81,10 +84,10 @@ Window {
         Item {
             GridLayout {
                 anchors.fill: parent
-                anchors.margins: 20
-                columns: 3
-                rowSpacing: 12
-                columnSpacing: 12
+                anchors.margins: 16
+                columns: 2
+                rowSpacing: 8
+                columnSpacing: 8
 
                 AppButton {
                     Layout.fillWidth: true
@@ -128,10 +131,10 @@ Window {
         Item {
             GridLayout {
                 anchors.fill: parent
-                anchors.margins: 20
+                anchors.margins: 16
                 columns: 3
-                rowSpacing: 12
-                columnSpacing: 12
+                rowSpacing: 8
+                columnSpacing: 8
 
                 AppButton {
                     Layout.fillWidth: true
@@ -164,7 +167,7 @@ Window {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     icon: "\u2261"
-                    label: "SDL2 Dashboard"
+                    label: "SDL2 Dash"
                     accent: "#50b4ff"
                     onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/sdl2_dashboard")
                 }
@@ -182,7 +185,7 @@ Window {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     icon: "\u25A1"
-                    label: "Spinning Square"
+                    label: "Spin Square"
                     accent: "#c878ff"
                     onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/solutions/sdl2-rotating-cube/build/step3_rotating_square")
                 }
@@ -211,23 +214,23 @@ Window {
                     rowSpacing: 20
                     columnSpacing: 40
 
-                    Text { text: "CPU"; color: "#808080"; font.pixelSize: 16 }
-                    Text { text: sysinfo.cpuPercent.toFixed(0) + "%"; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true }
+                    Text { text: "CPU"; color: "#808080"; font.pixelSize: 16; renderType: Text.NativeRendering }
+                    Text { text: sysinfo.cpuPercent.toFixed(0) + "%"; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true; renderType: Text.NativeRendering }
 
-                    Text { text: "Memory"; color: "#808080"; font.pixelSize: 16 }
-                    Text { text: sysinfo.memUsedMB + " / " + sysinfo.memTotalMB + " MB"; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true }
+                    Text { text: "Memory"; color: "#808080"; font.pixelSize: 16; renderType: Text.NativeRendering }
+                    Text { text: sysinfo.memUsedMB + " / " + sysinfo.memTotalMB + " MB"; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true; renderType: Text.NativeRendering }
 
-                    Text { text: "Temperature"; color: "#808080"; font.pixelSize: 16 }
-                    Text { text: sysinfo.temperature.toFixed(1) + " \u00B0C"; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true }
+                    Text { text: "Temperature"; color: "#808080"; font.pixelSize: 16; renderType: Text.NativeRendering }
+                    Text { text: sysinfo.temperature.toFixed(1) + " \u00B0C"; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true; renderType: Text.NativeRendering }
 
-                    Text { text: "Uptime"; color: "#808080"; font.pixelSize: 16 }
-                    Text { text: sysinfo.uptime; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true }
+                    Text { text: "Uptime"; color: "#808080"; font.pixelSize: 16; renderType: Text.NativeRendering }
+                    Text { text: sysinfo.uptime; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true; renderType: Text.NativeRendering }
 
-                    Text { text: "IP Address"; color: "#808080"; font.pixelSize: 16 }
-                    Text { text: sysinfo.ipAddress; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true }
+                    Text { text: "IP Address"; color: "#808080"; font.pixelSize: 16; renderType: Text.NativeRendering }
+                    Text { text: sysinfo.ipAddress; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true; renderType: Text.NativeRendering }
 
-                    Text { text: "Hostname"; color: "#808080"; font.pixelSize: 16 }
-                    Text { text: sysinfo.hostname; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true }
+                    Text { text: "Hostname"; color: "#808080"; font.pixelSize: 16; renderType: Text.NativeRendering }
+                    Text { text: sysinfo.hostname; color: "#dcdcdc"; font.pixelSize: 24; font.bold: true; renderType: Text.NativeRendering }
                 }
             }
         }
@@ -243,9 +246,13 @@ Window {
         anchors.horizontalCenter: parent.horizontalCenter
 
         delegate: Rectangle {
-            width: 10; height: 10
+            width: index === indicator.currentIndex ? 24 : 10
+            height: 10
             radius: 5
             color: index === indicator.currentIndex ? "#50b4ff" : "#3c3c41"
+            antialiasing: true
+            Behavior on width { NumberAnimation { duration: 200; easing.type: Easing.OutQuad } }
+            Behavior on color { ColorAnimation { duration: 200 } }
         }
     }
 
