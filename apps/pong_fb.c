@@ -2,7 +2,11 @@
  * pong_fb.c — Pong game for Linux framebuffer (/dev/fbN)
  *
  * Works on any monochrome 1bpp framebuffer: SSD1306 OLED (128x64, 128x32)
- * or BUSE LED matrix (128x19). Auto-detects resolution via ioctl.
+ * or BUSE LED matrix (128x19). Auto-detects resolution and pixel format.
+ *
+ * Supports two framebuffer layouts:
+ *   - Linear row-major (line_length == width/8): each byte = 8 horizontal pixels
+ *   - Page-oriented (line_length == width): each byte = 8 vertical pixels (SSD1306 native)
  *
  * Build:  gcc -o pong_fb pong_fb.c
  * Run:    ./pong_fb [/dev/fb0]
@@ -31,10 +35,11 @@ static int fb_fd = -1;
 static unsigned char *fb_mem = NULL;
 static size_t fb_size;
 static int width, height, line_length;
+static int page_oriented;  /* 1 = SSD1306 native page format, 0 = linear row-major */
 static struct termios orig_termios;
 static volatile int running = 1;
 
-/* --- Pixel helpers for 1bpp packed framebuffer --- */
+/* --- Pixel helpers --- */
 
 static void set_pixel(int x, int y, int on)
 {
@@ -43,8 +48,15 @@ static void set_pixel(int x, int y, int on)
 	if (x < 0 || x >= width || y < 0 || y >= height)
 		return;
 
-	byte_idx = y * line_length + x / 8;
-	bit_idx = 7 - (x % 8);  /* MSB = leftmost pixel */
+	if (page_oriented) {
+		/* Page-oriented: each byte = 8 vertical pixels in a column */
+		byte_idx = (y / 8) * width + x;
+		bit_idx = y % 8;
+	} else {
+		/* Linear row-major: each byte = 8 horizontal pixels, MSB = leftmost */
+		byte_idx = y * line_length + x / 8;
+		bit_idx = 7 - (x % 8);
+	}
 
 	if (on)
 		fb_mem[byte_idx] |= (1 << bit_idx);
@@ -145,10 +157,23 @@ int main(int argc, char *argv[])
 	width = vinfo.xres;
 	height = vinfo.yres;
 	line_length = finfo.line_length;
-	fb_size = line_length * height;
 
-	printf("Framebuffer: %s (%dx%d, %d bpp, line_length=%d)\n",
-	       fb_path, width, height, vinfo.bits_per_pixel, line_length);
+	/*
+	 * Detect pixel format from line_length:
+	 *   - line_length == width     → page-oriented (SSD1306 native)
+	 *   - line_length == width/8   → linear row-major (converted driver)
+	 */
+	if (line_length == width) {
+		page_oriented = 1;
+		fb_size = width * (height / 8);
+	} else {
+		page_oriented = 0;
+		fb_size = line_length * height;
+	}
+
+	printf("Framebuffer: %s (%dx%d, %d bpp, line_length=%d, %s)\n",
+	       fb_path, width, height, vinfo.bits_per_pixel, line_length,
+	       page_oriented ? "page-oriented" : "linear");
 
 	if (vinfo.bits_per_pixel != 1) {
 		fprintf(stderr, "Only 1bpp monochrome framebuffers supported\n");
