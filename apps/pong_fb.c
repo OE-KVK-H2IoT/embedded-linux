@@ -53,9 +53,10 @@ static void set_pixel(int x, int y, int on)
 		byte_idx = (y / 8) * width + x;
 		bit_idx = y % 8;
 	} else {
-		/* Linear row-major: each byte = 8 horizontal pixels, MSB = leftmost */
+		/* Linear row-major: each byte = 8 horizontal pixels, LSB = leftmost
+		 * (mainline ssd1307fb convention: bit 0 is the leftmost pixel) */
 		byte_idx = y * line_length + x / 8;
-		bit_idx = 7 - (x % 8);
+		bit_idx = x % 8;
 	}
 
 	if (on)
