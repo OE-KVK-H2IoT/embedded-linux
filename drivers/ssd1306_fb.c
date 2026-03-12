@@ -114,14 +114,15 @@ static void ssd1306_update_display(struct ssd1306_par *par)
 	memset(par->buffer, 0, buf_size);
 
 	/*
-	 * Convert from linear 1bpp framebuffer (row-major, MSB=leftmost pixel)
-	 * to SSD1306 page format (each byte = 8 vertical pixels in a column).
+	 * Convert from linear 1bpp framebuffer (row-major, LSB=leftmost pixel,
+	 * matching mainline ssd1307fb convention) to SSD1306 page format
+	 * (each byte = 8 vertical pixels in a column).
 	 */
 	for (y = 0; y < par->height; y++) {
 		page = y / 8;
 		for (x = 0; x < par->width; x++) {
 			int src_byte = (y * par->width + x) / 8;
-			int src_bit = 7 - (x % 8);
+			int src_bit = x % 8;
 
 			if (vmem[src_byte] & (1 << src_bit))
 				par->buffer[page * par->width + x] |=
