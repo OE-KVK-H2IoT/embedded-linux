@@ -144,6 +144,21 @@ SUBSYSTEM=="i2c-dev", GROUP="i2c", MODE="0660"
 SUBSYSTEM=="spidev", GROUP="spi", MODE="0660"
 UDEV
 
+# ── Disable fbcon cursor (prevents blinking cursor on OLED fb) ─
+cat > /etc/systemd/system/fb-nocursor.service <<'FBSVC'
+[Unit]
+Description=Disable fbcon cursor on OLED
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 0 > /sys/class/graphics/fbcon/cursor_blink; for f in /sys/class/vtconsole/vtcon*/bind; do echo 0 > "$f"; done 2>/dev/null; true'
+
+[Install]
+WantedBy=multi-user.target
+FBSVC
+systemctl enable fb-nocursor.service
+
 # ── Install lab packages ──────────────────────────────────────
 apt-get update
 
