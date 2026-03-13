@@ -693,7 +693,7 @@ int main(int argc, char *argv[])
 	/* High-pass filter state */
 	float hp_y1 = 0, hp_x1 = 0;
 	float hp_y2 = 0, hp_x2 = 0;
-	float hp_alpha = 0.995f; /* ~80 Hz cutoff at 48 kHz */
+	float hp_alpha = 0.985f; /* ~115 Hz cutoff at 48 kHz — kills mains hum */
 	int warmup = 5; /* discard first N blocks to let HP filter settle */
 
 	/* Waveform history — circular buffer holding wave_ms of audio */
@@ -994,7 +994,7 @@ int main(int argc, char *argv[])
 		rms_db_avg = rms_db_avg * 0.85f + rms_db_now * 0.15f;
 
 		/* Find dominant frequency — skip DC area and top 5% (noise) */
-		int bin_min = (int)(80.0f / ((float)sample_rate / fft_size));
+		int bin_min = (int)(120.0f / ((float)sample_rate / fft_size));
 		int bin_max = half_fft * 95 / 100;
 		if (bin_min < 1) bin_min = 1;
 		int peak_bin = bin_min;
@@ -1006,7 +1006,7 @@ int main(int argc, char *argv[])
 			}
 		}
 		float dom_freq_now = (float)peak_bin * sample_rate / fft_size;
-		dom_freq_avg = dom_freq_avg * 0.8f + dom_freq_now * 0.2f;
+		dom_freq_avg = dom_freq_avg * 0.95f + dom_freq_now * 0.05f;
 
 		int txt_scale = 2;
 		int line_h = (FONT_H + 2) * txt_scale;
