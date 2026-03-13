@@ -68,31 +68,6 @@ static void apply_hann_window(const float *in, float *out, int n)
 		out[i] = in[i] * 0.5f * (1.0f - cosf(2.0f * M_PI * i / (n - 1)));
 }
 
-static void dc_remove(float *buf, int n)
-{
-	float sum = 0;
-	for (int i = 0; i < n; i++) sum += buf[i];
-	float mean = sum / n;
-	for (int i = 0; i < n; i++) buf[i] -= mean;
-}
-
-/* High-pass filter (1st order IIR, ~80 Hz at 48 kHz) */
-static float hp_state_l = 0, hp_state_r = 0;
-
-static void highpass_inplace(float *buf, int n, float *state, float alpha)
-{
-	float prev = *state;
-	for (int i = 0; i < n; i++) {
-		float x = buf[i];
-		buf[i] = alpha * (prev + x - buf[i]);
-		/* Corrected 1st-order HP: y[n] = alpha * (y[n-1] + x[n] - x[n-1]) */
-		buf[i] = alpha * (prev) + alpha * (x - (i > 0 ? buf[i-1]/alpha + buf[i-1]*(1-alpha)/alpha : *state));
-		/* Simplified: just use DC removal + gentle IIR */
-		prev = buf[i];
-	}
-	*state = prev;
-}
-
 /* Simple 1-pole high-pass: y[n] = alpha * (y[n-1] + x[n] - x[n-1]) */
 static void highpass_1pole(float *buf, int n, float *y_prev, float *x_prev,
 			   float alpha)
@@ -364,7 +339,8 @@ static void draw_level_bar(SDL_Renderer *r, const char *label,
 	/* RMS bar (green) */
 	float rms_db = 20.0f * log10f(rms + 1e-10f);
 	float norm = (rms_db + 60) / 60;
-	if (norm < 0) norm = 0; if (norm > 1) norm = 1;
+	if (norm < 0) norm = 0;
+	if (norm > 1) norm = 1;
 	int bar_w = (int)(norm * (w - 2));
 	SDL_SetRenderDrawColor(r, 0, 180, 0, 255);
 	SDL_Rect rms_bar = { x0 + 1, y0 + 1, bar_w, h - 2 };
@@ -373,7 +349,8 @@ static void draw_level_bar(SDL_Renderer *r, const char *label,
 	/* Peak marker (red line) */
 	float peak_db = 20.0f * log10f(peak + 1e-10f);
 	float pnorm = (peak_db + 60) / 60;
-	if (pnorm < 0) pnorm = 0; if (pnorm > 1) pnorm = 1;
+	if (pnorm < 0) pnorm = 0;
+	if (pnorm > 1) pnorm = 1;
 	int peak_x = x0 + 1 + (int)(pnorm * (w - 2));
 	SDL_SetRenderDrawColor(r, 255, 50, 50, 255);
 	SDL_RenderDrawLine(r, peak_x, y0 + 1, peak_x, y0 + h - 1);
@@ -478,7 +455,7 @@ int main(int argc, char *argv[])
 	/* GCC-PHAT plans (only if stereo) */
 	float *gcc_in1 = NULL, *gcc_in2 = NULL, *gcc_inv_out = NULL;
 	fftwf_complex *gcc_out1 = NULL, *gcc_out2 = NULL, *gcc_cross = NULL;
-	fftwf_plan gcc_fwd1, gcc_fwd2, gcc_inv;
+	fftwf_plan gcc_fwd1 = NULL, gcc_fwd2 = NULL, gcc_inv = NULL;
 	float *corr = NULL;
 
 	if (channels == 2) {
@@ -506,8 +483,7 @@ int main(int argc, char *argv[])
 	/* High-pass filter state */
 	float hp_y1 = 0, hp_x1 = 0;
 	float hp_y2 = 0, hp_x2 = 0;
-	float hp_alpha = 1.0f - expf(-2.0f * M_PI * 80.0f / sample_rate);
-	hp_alpha = 0.995f; /* ~80 Hz at 48 kHz */
+	float hp_alpha = 0.995f; /* ~80 Hz cutoff at 48 kHz */
 
 	/* SDL2 init */
 	SDL_Init(SDL_INIT_VIDEO);
@@ -593,7 +569,6 @@ int main(int argc, char *argv[])
 			spec_col = (spec_col + 1) % SPEC_HISTORY;
 
 			/* Level meters */
-			float rms = compute_rms(ch1_buf, period_frames);
 			float peak = compute_peak(ch1_buf, period_frames);
 			peak_smooth = peak > peak_smooth ? peak :
 				      peak_smooth * 0.95f;
@@ -656,9 +631,7 @@ int main(int argc, char *argv[])
 			      db_floor, db_ceil);
 		y_after_wave += spec_bar_h + 5;
 
-		/* Spectrogram */
-		SDL_Rect spec_dst = { margin, y_after_wave, panel_w, spec_h };
-		/* Render spectrogram scrolled so current column is rightmost */
+		/* Spectrogram — render scrolled so current column is rightmost */
 		/* Left part: columns from spec_col to SPEC_HISTORY */
 		int left_cols = SPEC_HISTORY - spec_col;
 		if (left_cols > 0) {
