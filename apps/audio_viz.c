@@ -691,6 +691,9 @@ int main(int argc, char *argv[])
 	}
 	int spec_col = 0;
 
+	/* Averaged magnitude buffer for stereo spectrogram */
+	float *spec_avg = channels == 2 ? calloc(half_fft, sizeof(float)) : NULL;
+
 	/* Smoothed peak for meters */
 	float peak_smooth = 0;
 
@@ -774,9 +777,18 @@ int main(int argc, char *argv[])
 				compute_magnitude_db(fft_out, mag_db2, fft_size);
 			}
 
-			/* Spectrogram column */
-			draw_spectrogram_col(spec_tex, mag_db, half_fft,
-					     spec_col, spec_h, db_floor, db_ceil);
+			/* Spectrogram column — average L+R for stereo */
+			if (channels == 2) {
+				for (int i = 0; i < half_fft; i++)
+					spec_avg[i] = (mag_db[i] + mag_db2[i]) * 0.5f;
+				draw_spectrogram_col(spec_tex, spec_avg, half_fft,
+						     spec_col, spec_h,
+						     db_floor, db_ceil);
+			} else {
+				draw_spectrogram_col(spec_tex, mag_db, half_fft,
+						     spec_col, spec_h,
+						     db_floor, db_ceil);
+			}
 			spec_col = (spec_col + 1) % SPEC_HISTORY;
 
 			/* Level meters */
@@ -814,13 +826,18 @@ int main(int argc, char *argv[])
 
 		int margin = 10;
 		int panel_w = WIN_W - 2 * margin;
+		int stereo = (channels == 2);
+
+		/* In stereo, reserve right panel for stats + direction */
+		int right_w = stereo ? 190 : 0;
+		int left_w = panel_w - (stereo ? right_w + 10 : 0);
+		int right_x = margin + left_w + 10;
 
 		/* Waveform: top area — linearize circular history buffer.
 		 * Only draw the filled portion to avoid zero-gap spikes. */
-		int wave_h = channels == 2 ? 70 : 100;
+		int wave_h = stereo ? 55 : 100;
 		int draw_n = wave_filled < wave_samples ? wave_filled : wave_samples;
 		if (draw_n > 0) {
-			/* Start reading from (wave_pos - draw_n), wrapping */
 			int start = (wave_pos - draw_n + wave_samples) % wave_samples;
 			float *lin1 = malloc(draw_n * sizeof(float));
 			for (int i = 0; i < draw_n; i++)
@@ -830,90 +847,89 @@ int main(int argc, char *argv[])
 				      0, 200, 255);
 			free(lin1);
 
-			if (channels == 2) {
+			if (stereo) {
 				float *lin2 = malloc(draw_n * sizeof(float));
 				for (int i = 0; i < draw_n; i++)
 					lin2[i] = wave_hist2[(start + i) % wave_samples];
 				draw_waveform(ren, lin2, draw_n,
-					      margin, margin + wave_h + 5,
+					      margin, margin + wave_h + 3,
 					      panel_w, wave_h,
 					      255, 150, 0);
 				free(lin2);
 			}
 		}
 
-		int y_after_wave = margin + (channels == 2 ? 2 * wave_h + 10 : wave_h + 5);
+		int y_cur = margin + (stereo ? 2 * wave_h + 6 : wave_h + 5);
 
-		/* Level meter */
+		/* Level meters (full width) */
 		float rms = compute_rms(ch1_buf, period_frames);
-		draw_level_bar(ren, "RMS", rms, peak_smooth,
-			       margin, y_after_wave, panel_w, 15);
-		y_after_wave += 20;
+		draw_level_bar(ren, "L", rms, peak_smooth,
+			       margin, y_cur, panel_w, 12);
+		y_cur += 15;
 
-		/* Ch2 level meter (stereo only) */
-		if (channels == 2) {
+		if (stereo) {
 			float rms2 = compute_rms(ch2_buf, period_frames);
 			float peak2 = compute_peak(ch2_buf, period_frames);
 			draw_level_bar(ren, "R", rms2, peak2,
-				       margin, y_after_wave, panel_w, 15);
-			y_after_wave += 20;
+				       margin, y_cur, panel_w, 12);
+			y_cur += 15;
 		}
 
-		/* FFT spectrum — ch1 (cyan bars) */
-		int spec_bar_h = 100;
-		draw_spectrum(ren, mag_db, half_fft,
-			      margin, y_after_wave, panel_w, spec_bar_h,
-			      db_floor, db_ceil, sample_rate, fft_size);
+		/* ── Left column: spectra + spectrogram ──────────── */
+		int y_left = y_cur;
 
-		/* Ch2 spectrum overlay (orange, semi-transparent look via thinner bars) */
-		if (channels == 2 && mag_db2) {
-			float db_range = db_ceil - db_floor;
-			SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-			for (int i = 0; i < panel_w && i < half_fft; i++) {
-				int bin = i * half_fft / panel_w;
-				float norm = (mag_db2[bin] - db_floor) / db_range;
-				if (norm < 0) norm = 0;
-				if (norm > 1) norm = 1;
-				int bar_h2 = (int)(norm * spec_bar_h);
-				SDL_SetRenderDrawColor(ren, 255, 140, 30, 140);
-				SDL_RenderDrawLine(ren, margin + i,
-						   y_after_wave + spec_bar_h - bar_h2,
-						   margin + i,
-						   y_after_wave + spec_bar_h);
-			}
-			SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+		if (stereo) {
+			/* Two separate spectrum panels: L then R */
+			int sh = 65;
+
+			/* "L" label */
+			SDL_SetRenderDrawColor(ren, 0, 200, 255, 255);
+			draw_text(ren, "L", margin + 2, y_left + 2, 1);
+			draw_spectrum(ren, mag_db, half_fft,
+				      margin, y_left, left_w, sh,
+				      db_floor, db_ceil, sample_rate, fft_size);
+			y_left += sh + 3;
+
+			/* "R" label */
+			SDL_SetRenderDrawColor(ren, 255, 150, 0, 255);
+			draw_text(ren, "R", margin + 2, y_left + 2, 1);
+			draw_spectrum(ren, mag_db2, half_fft,
+				      margin, y_left, left_w, sh,
+				      db_floor, db_ceil, sample_rate, fft_size);
+			y_left += sh + 3;
+		} else {
+			/* Mono: single spectrum, full width */
+			int sh = 100;
+			draw_spectrum(ren, mag_db, half_fft,
+				      margin, y_left, left_w, sh,
+				      db_floor, db_ceil, sample_rate, fft_size);
+			y_left += sh + 5;
 		}
-		y_after_wave += spec_bar_h + 5;
 
 		/* Spectrogram — render scrolled so current column is rightmost */
-		/* Left part: columns from spec_col to SPEC_HISTORY */
+		int sgram_h = WIN_H - y_left - margin;
+		if (sgram_h < 40) sgram_h = 40;
+		int sgram_w = left_w;
+
 		int left_cols = SPEC_HISTORY - spec_col;
 		if (left_cols > 0) {
 			SDL_Rect src1 = { spec_col, 0, left_cols, spec_h };
-			SDL_Rect dst1 = { margin, y_after_wave,
-					  left_cols * panel_w / SPEC_HISTORY,
-					  spec_h };
+			SDL_Rect dst1 = { margin, y_left,
+					  left_cols * sgram_w / SPEC_HISTORY,
+					  sgram_h };
 			SDL_RenderCopy(ren, spec_tex, &src1, &dst1);
 		}
-		/* Right part: columns 0 to spec_col */
 		if (spec_col > 0) {
 			SDL_Rect src2 = { 0, 0, spec_col, spec_h };
 			SDL_Rect dst2 = {
-				margin + left_cols * panel_w / SPEC_HISTORY,
-				y_after_wave,
-				spec_col * panel_w / SPEC_HISTORY,
-				spec_h };
+				margin + left_cols * sgram_w / SPEC_HISTORY,
+				y_left,
+				spec_col * sgram_w / SPEC_HISTORY,
+				sgram_h };
 			SDL_RenderCopy(ren, spec_tex, &src2, &dst2);
 		}
-		y_after_wave += spec_h + 5;
 
-		/* Direction indicator (stereo only) */
-		if (channels == 2) {
-			int dir_r = 50;
-			draw_direction_indicator(ren, angle_deg, confidence,
-						 WIN_W - margin - dir_r - 10,
-						 margin + dir_r + 10, dir_r);
-		}
+		/* ── Right column (stereo) or bottom (mono): stats ── */
 
 		/* Measure capture-to-display latency (moving average) */
 		struct timespec now;
@@ -944,21 +960,61 @@ int main(int argc, char *argv[])
 		float dom_freq_now = (float)peak_bin * sample_rate / fft_size;
 		dom_freq_avg = dom_freq_avg * 0.8f + dom_freq_now * 0.2f;
 
-		/* Fixed-width labels + values so text doesn't jump */
-		char line1[64], line2[64];
-		snprintf(line1, sizeof(line1), "Latency %6.1f ms   RMS %6.1f dB",
-			 latency_avg, rms_db_avg);
-		snprintf(line2, sizeof(line2), "Freq  %6d Hz   Gain  %5.1fx",
-			 (int)dom_freq_avg, gain);
-
 		int txt_scale = 2;
 		int line_h = (FONT_H + 2) * txt_scale;
 
-		/* Label color (dimmer) */
-		SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
-		draw_text(ren, line1, margin, y_after_wave, txt_scale);
-		SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
-		draw_text(ren, line2, margin, y_after_wave + line_h, txt_scale);
+		if (stereo) {
+			/* Stats in right panel */
+			int sy = y_cur;
+			SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
+
+			char stat[32];
+			snprintf(stat, sizeof(stat), "Lat %5.1f ms", latency_avg);
+			draw_text(ren, stat, right_x, sy, txt_scale);
+			sy += line_h;
+
+			snprintf(stat, sizeof(stat), "RMS %5.1f dB", rms_db_avg);
+			draw_text(ren, stat, right_x, sy, txt_scale);
+			sy += line_h;
+
+			snprintf(stat, sizeof(stat), "Frq %5d Hz", (int)dom_freq_avg);
+			draw_text(ren, stat, right_x, sy, txt_scale);
+			sy += line_h;
+
+			snprintf(stat, sizeof(stat), "Gain %4.1fx", gain);
+			draw_text(ren, stat, right_x, sy, txt_scale);
+			sy += line_h + 10;
+
+			/* Direction indicator */
+			int dir_r = 60;
+			int dir_cx = right_x + right_w / 2;
+			int dir_cy = sy + dir_r + 5;
+			if (dir_cy + dir_r < WIN_H - margin) {
+				draw_direction_indicator(ren, angle_deg,
+							 confidence,
+							 dir_cx, dir_cy, dir_r);
+
+				/* Angle label below indicator */
+				char ang[32];
+				snprintf(ang, sizeof(ang), "%3.0f deg", angle_deg);
+				SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
+				draw_text(ren, ang, dir_cx - 30,
+					  dir_cy + dir_r + 5, txt_scale);
+			}
+		} else {
+			/* Mono: stats below spectrogram */
+			int sy = y_left + sgram_h + 5;
+			char line1[64], line2[64];
+			snprintf(line1, sizeof(line1),
+				 "Latency %6.1f ms   RMS %6.1f dB",
+				 latency_avg, rms_db_avg);
+			snprintf(line2, sizeof(line2),
+				 "Freq  %6d Hz   Gain  %5.1fx",
+				 (int)dom_freq_avg, gain);
+			SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
+			draw_text(ren, line1, margin, sy, txt_scale);
+			draw_text(ren, line2, margin, sy + line_h, txt_scale);
+		}
 
 		SDL_RenderPresent(ren);
 	}
@@ -985,6 +1041,7 @@ int main(int argc, char *argv[])
 
 	free(mag_db);
 	free(mag_db2);
+	free(spec_avg);
 	free(ch1_buf);
 	free(ch2_buf);
 	free(windowed);
