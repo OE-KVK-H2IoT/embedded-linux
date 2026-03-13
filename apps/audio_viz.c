@@ -714,6 +714,7 @@ int main(int argc, char *argv[])
 		WIN_W, WIN_H, 0);
 	SDL_Renderer *ren = SDL_CreateRenderer(win, -1,
 		SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+	SDL_ShowCursor(SDL_DISABLE);
 
 	/* Spectrogram texture */
 	int spec_h = 150;
