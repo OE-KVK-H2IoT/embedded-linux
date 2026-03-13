@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
@@ -186,7 +187,7 @@ static void *audio_thread(void *arg)
 	snd_pcm_hw_params_alloca(&hw);
 	snd_pcm_hw_params_any(pcm, hw);
 	snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
-	snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_FLOAT_LE);
+	snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S32_LE);
 	snd_pcm_hw_params_set_channels(pcm, hw, channels);
 	snd_pcm_hw_params_set_rate_near(pcm, hw, &sample_rate, NULL);
 	snd_pcm_hw_params_set_period_size_near(pcm, hw, &period_frames, NULL);
@@ -201,14 +202,15 @@ static void *audio_thread(void *arg)
 	/* Query actual values after negotiation */
 	snd_pcm_hw_params_get_rate(hw, &sample_rate, NULL);
 	snd_pcm_hw_params_get_period_size(hw, &period_frames, NULL);
-	printf("ALSA: %s, %u Hz, %u ch, period %lu frames\n",
+	printf("ALSA: %s, %u Hz, %u ch, period %lu frames (S32_LE)\n",
 	       alsa_device, sample_rate, channels, period_frames);
 
 	int slot_size = channels * period_frames;
+	int32_t *raw_buf = malloc(slot_size * sizeof(int32_t));
 	float *tmp = malloc(slot_size * sizeof(float));
 
 	while (running) {
-		snd_pcm_sframes_t n = snd_pcm_readi(pcm, tmp, period_frames);
+		snd_pcm_sframes_t n = snd_pcm_readi(pcm, raw_buf, period_frames);
 		if (n < 0) {
 			n = snd_pcm_recover(pcm, (int)n, 0);
 			if (n < 0) {
@@ -217,6 +219,11 @@ static void *audio_thread(void *arg)
 			}
 			continue;
 		}
+
+		/* Convert S32_LE to float [-1.0, 1.0]
+		 * I2S mics output 24-bit data in upper bits of 32-bit word */
+		for (int i = 0; i < (int)(n * channels); i++)
+			tmp[i] = (float)raw_buf[i] / 2147483648.0f;
 
 		pthread_mutex_lock(&ring_mtx);
 		memcpy(ring_buf + ring_write * slot_size, tmp,
@@ -227,6 +234,7 @@ static void *audio_thread(void *arg)
 		pthread_mutex_unlock(&ring_mtx);
 	}
 
+	free(raw_buf);
 	free(tmp);
 	snd_pcm_close(pcm);
 	return NULL;
@@ -450,7 +458,7 @@ int main(int argc, char *argv[])
 	float *fft_in = fftwf_alloc_real(fft_size);
 	fftwf_complex *fft_out = fftwf_alloc_complex(half_fft);
 	fftwf_plan plan_fwd = fftwf_plan_dft_r2c_1d(fft_size, fft_in, fft_out,
-						     FFTW_MEASURE);
+						     FFTW_ESTIMATE);
 
 	/* GCC-PHAT plans (only if stereo) */
 	float *gcc_in1 = NULL, *gcc_in2 = NULL, *gcc_inv_out = NULL;
@@ -468,11 +476,11 @@ int main(int argc, char *argv[])
 		corr = calloc(fft_size, sizeof(float));
 
 		gcc_fwd1 = fftwf_plan_dft_r2c_1d(fft_size, gcc_in1, gcc_out1,
-						  FFTW_MEASURE);
+						  FFTW_ESTIMATE);
 		gcc_fwd2 = fftwf_plan_dft_r2c_1d(fft_size, gcc_in2, gcc_out2,
-						  FFTW_MEASURE);
+						  FFTW_ESTIMATE);
 		gcc_inv = fftwf_plan_dft_c2r_1d(fft_size, gcc_cross, gcc_inv_out,
-						FFTW_MEASURE);
+						FFTW_ESTIMATE);
 	}
 
 	float *mag_db = calloc(half_fft, sizeof(float));
