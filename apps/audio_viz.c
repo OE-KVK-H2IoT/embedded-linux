@@ -45,6 +45,8 @@
 #define SPEED_OF_SOUND    343.0f    /* m/s */
 #define DEFAULT_MIC_DIST  0.06f     /* 6 cm default mic spacing */
 #define DEFAULT_GAIN      4.0f      /* software gain (I2S mics are often quiet) */
+#define DEFAULT_WAVE_MS   50        /* waveform display length in ms */
+#define MAX_WAVE_SAMPLES  (48000*2) /* max 2 seconds of waveform history */
 
 /* ── Globals ────────────────────────────────────────────────────────── */
 
@@ -57,6 +59,7 @@ static unsigned int channels = DEFAULT_CHANNELS;
 static snd_pcm_uframes_t period_frames = DEFAULT_FRAMES;
 static float mic_distance = DEFAULT_MIC_DIST;
 static float gain = DEFAULT_GAIN;
+static int wave_ms = DEFAULT_WAVE_MS;
 
 /* Ring buffer: audio thread writes, render thread reads */
 static float *ring_buf;           /* [RING_SLOTS][channels * period_frames] */
@@ -565,10 +568,12 @@ static void usage(const char *prog)
 		"  -c CHANS    Channels: 1 or 2 (default: %u)\n"
 		"  -n FRAMES   Period/FFT size (default: %lu)\n"
 		"  -g GAIN     Software gain multiplier (default: %.1f)\n"
+		"  -w MS       Waveform display length in ms (default: %d)\n"
 		"  -m DIST     Mic distance in metres for DOA (default: %.3f)\n"
 		"  -h          Show this help\n",
 		prog, DEFAULT_DEVICE, DEFAULT_RATE, DEFAULT_CHANNELS,
-		(unsigned long)DEFAULT_FRAMES, DEFAULT_GAIN, DEFAULT_MIC_DIST);
+		(unsigned long)DEFAULT_FRAMES, DEFAULT_GAIN,
+		DEFAULT_WAVE_MS, DEFAULT_MIC_DIST);
 }
 
 /* ── Main ───────────────────────────────────────────────────────────── */
@@ -576,13 +581,14 @@ static void usage(const char *prog)
 int main(int argc, char *argv[])
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "d:r:c:n:g:m:h")) != -1) {
+	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:h")) != -1) {
 		switch (opt) {
 		case 'd': alsa_device = optarg; break;
 		case 'r': sample_rate = atoi(optarg); break;
 		case 'c': channels = atoi(optarg); break;
 		case 'n': period_frames = atoi(optarg); break;
 		case 'g': gain = atof(optarg); break;
+		case 'w': wave_ms = atoi(optarg); break;
 		case 'm': mic_distance = atof(optarg); break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
@@ -652,6 +658,16 @@ int main(int argc, char *argv[])
 	float hp_y1 = 0, hp_x1 = 0;
 	float hp_y2 = 0, hp_x2 = 0;
 	float hp_alpha = 0.995f; /* ~80 Hz cutoff at 48 kHz */
+
+	/* Waveform history — circular buffer holding wave_ms of audio */
+	int wave_samples = (int)((float)wave_ms / 1000.0f * sample_rate);
+	if (wave_samples < (int)period_frames) wave_samples = (int)period_frames;
+	if (wave_samples > MAX_WAVE_SAMPLES) wave_samples = MAX_WAVE_SAMPLES;
+	float *wave_hist1 = calloc(wave_samples, sizeof(float));
+	float *wave_hist2 = channels == 2 ? calloc(wave_samples, sizeof(float)) : NULL;
+	int wave_pos = 0; /* write cursor in circular buffer */
+
+	printf("Waveform: %d ms = %d samples\n", wave_ms, wave_samples);
 
 	/* SDL2 init */
 	SDL_Init(SDL_INIT_VIDEO);
@@ -732,6 +748,14 @@ int main(int argc, char *argv[])
 				highpass_1pole(ch2_buf, period_frames, &hp_y2,
 					       &hp_x2, hp_alpha);
 
+			/* Append to waveform history */
+			for (int i = 0; i < (int)period_frames; i++) {
+				wave_hist1[wave_pos] = ch1_buf[i];
+				if (channels == 2)
+					wave_hist2[wave_pos] = ch2_buf[i];
+				wave_pos = (wave_pos + 1) % wave_samples;
+			}
+
 			/* FFT of channel 1 */
 			apply_hann_window(ch1_buf, windowed, fft_size);
 			memcpy(fft_in, windowed, fft_size * sizeof(float));
@@ -779,17 +803,29 @@ int main(int argc, char *argv[])
 		int margin = 10;
 		int panel_w = WIN_W - 2 * margin;
 
-		/* Waveform: top area */
+		/* Waveform: top area — linearize circular history buffer */
 		int wave_h = channels == 2 ? 70 : 100;
-		draw_waveform(ren, ch1_buf, period_frames,
-			      margin, margin, panel_w, wave_h,
-			      0, 200, 255);
+		{
+			/* Oldest sample is at wave_pos, newest at wave_pos-1 */
+			float *lin1 = malloc(wave_samples * sizeof(float));
+			for (int i = 0; i < wave_samples; i++)
+				lin1[i] = wave_hist1[(wave_pos + i) % wave_samples];
+			draw_waveform(ren, lin1, wave_samples,
+				      margin, margin, panel_w, wave_h,
+				      0, 200, 255);
+			free(lin1);
+		}
 
-		if (channels == 2)
-			draw_waveform(ren, ch2_buf, period_frames,
+		if (channels == 2) {
+			float *lin2 = malloc(wave_samples * sizeof(float));
+			for (int i = 0; i < wave_samples; i++)
+				lin2[i] = wave_hist2[(wave_pos + i) % wave_samples];
+			draw_waveform(ren, lin2, wave_samples,
 				      margin, margin + wave_h + 5,
 				      panel_w, wave_h,
 				      255, 150, 0);
+			free(lin2);
+		}
 
 		int y_after_wave = margin + (channels == 2 ? 2 * wave_h + 10 : wave_h + 5);
 
@@ -909,6 +945,8 @@ int main(int argc, char *argv[])
 	free(ch2_buf);
 	free(windowed);
 	free(ring_buf);
+	free(wave_hist1);
+	free(wave_hist2);
 
 	SDL_DestroyTexture(spec_tex);
 	SDL_DestroyRenderer(ren);
