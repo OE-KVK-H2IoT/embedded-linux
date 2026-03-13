@@ -258,6 +258,8 @@ static void draw_waveform(SDL_Renderer *r, const float *buf, int n,
 			  Uint8 cr, Uint8 cg, Uint8 cb)
 {
 	int mid = y0 + h / 2;
+	int ytop = y0 + 1;
+	int ybot = y0 + h - 1;
 
 	/* Border */
 	SDL_SetRenderDrawColor(r, 60, 60, 60, 255);
@@ -268,14 +270,45 @@ static void draw_waveform(SDL_Renderer *r, const float *buf, int n,
 	SDL_SetRenderDrawColor(r, 40, 40, 40, 255);
 	SDL_RenderDrawLine(r, x0, mid, x0 + w, mid);
 
-	/* Waveform */
+	/* Waveform — for each pixel column, find min/max sample in that
+	 * range and draw a vertical line between them. This produces a
+	 * filled waveform that doesn't miss peaks even when zoomed out. */
 	SDL_SetRenderDrawColor(r, cr, cg, cb, 255);
-	for (int i = 1; i < w && i < n; i++) {
-		int idx0 = (i - 1) * n / w;
-		int idx1 = i * n / w;
-		int py0 = mid - (int)(buf[idx0] * h / 2);
-		int py1 = mid - (int)(buf[idx1] * h / 2);
-		SDL_RenderDrawLine(r, x0 + i - 1, py0, x0 + i, py1);
+
+	int prev_y = mid;
+	for (int i = 0; i < w; i++) {
+		int s0 = i * n / w;
+		int s1 = (i + 1) * n / w;
+		if (s1 <= s0) s1 = s0 + 1;
+		if (s1 > n) s1 = n;
+
+		float vmin = buf[s0], vmax = buf[s0];
+		for (int s = s0 + 1; s < s1; s++) {
+			if (buf[s] < vmin) vmin = buf[s];
+			if (buf[s] > vmax) vmax = buf[s];
+		}
+
+		/* Clamp to drawing area */
+		int py_min = mid - (int)(vmax * h / 2);
+		int py_max = mid - (int)(vmin * h / 2);
+		if (py_min < ytop) py_min = ytop;
+		if (py_max > ybot) py_max = ybot;
+		if (py_min > ybot) py_min = ybot;
+		if (py_max < ytop) py_max = ytop;
+
+		/* Connect to previous column for continuity */
+		if (i > 0) {
+			if (prev_y < py_min)
+				SDL_RenderDrawLine(r, x0 + i, prev_y, x0 + i, py_min);
+			else if (prev_y > py_max)
+				SDL_RenderDrawLine(r, x0 + i, py_max, x0 + i, prev_y);
+		}
+
+		/* Draw min-max span */
+		SDL_RenderDrawLine(r, x0 + i, py_min, x0 + i, py_max);
+		prev_y = mid - (int)(buf[s1 - 1] * h / 2);
+		if (prev_y < ytop) prev_y = ytop;
+		if (prev_y > ybot) prev_y = ybot;
 	}
 }
 
