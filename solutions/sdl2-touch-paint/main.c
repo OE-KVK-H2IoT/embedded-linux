@@ -103,14 +103,26 @@ int main(int argc, char **argv)
     int ci = 0;
     int num_colors = sizeof(colors) / sizeof(colors[0]);
 
+    int swipe_exit = 0;
+
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
+            /* Swipe up from bottom edge to exit */
+            if (e.type == SDL_FINGERDOWN && e.tfinger.y > 0.9f)
+                swipe_exit = 1;
+            if (e.type == SDL_FINGERUP)
+                swipe_exit = 0;
+            if (e.type == SDL_FINGERMOTION && swipe_exit &&
+                e.tfinger.y < 0.5f)
+                running = 0;
+
             switch (e.type) {
             case SDL_QUIT:
                 running = 0; break;
             case SDL_KEYDOWN:
-                if (e.key.keysym.sym == SDLK_ESCAPE) running = 0;
+                if (e.key.keysym.sym == SDLK_ESCAPE ||
+                    e.key.keysym.sym == SDLK_q) running = 0;
                 if (e.key.keysym.sym == SDLK_c) {
                     SDL_SetRenderTarget(ren, canvas);
                     SDL_SetRenderDrawColor(ren, 20, 20, 24, 255);

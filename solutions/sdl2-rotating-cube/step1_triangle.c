@@ -125,12 +125,18 @@ int main(int argc, char **argv)
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
 
     /* ── Render loop ── */
-    int running = 1;
+    int running = 1, swipe_exit = 0;
     while (running) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = 0;
-            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)
+            if (e.type == SDL_KEYDOWN &&
+                (e.key.keysym.sym == SDLK_ESCAPE ||
+                 e.key.keysym.sym == SDLK_q))
+                running = 0;
+            if (e.type == SDL_FINGERDOWN && e.tfinger.y > 0.9f) swipe_exit = 1;
+            if (e.type == SDL_FINGERUP) swipe_exit = 0;
+            if (e.type == SDL_FINGERMOTION && swipe_exit && e.tfinger.y < 0.5f)
                 running = 0;
         }
 

@@ -37,7 +37,8 @@ Item {
 
         /* Subtle accent glow behind the icon */
         Rectangle {
-            anchors.centerIn: iconText
+            x: iconText.x + (iconText.width - width) / 2 + col.x
+            y: iconText.y + (iconText.height - height) / 2 + col.y
             width: iconText.paintedWidth + 24
             height: iconText.paintedHeight + 24
             radius: width / 2
@@ -48,6 +49,7 @@ Item {
         }
 
         Column {
+            id: col
             anchors.centerIn: parent
             spacing: 6
             width: parent.width - 16

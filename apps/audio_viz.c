@@ -709,13 +709,13 @@ int main(int argc, char *argv[])
 
 	/* SDL2 init */
 	SDL_Init(SDL_INIT_VIDEO);
+	if (getenv("HIDE_CURSOR"))
+		SDL_ShowCursor(SDL_DISABLE);
 	SDL_Window *win = SDL_CreateWindow("Audio Visualizer",
 		SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
 		WIN_W, WIN_H, 0);
 	SDL_Renderer *ren = SDL_CreateRenderer(win, -1,
 		SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-	if (getenv("HIDE_CURSOR"))
-		SDL_ShowCursor(SDL_DISABLE);
 
 	/* Spectrogram texture */
 	int spec_h = 150;
@@ -762,12 +762,25 @@ int main(int argc, char *argv[])
 
 	/* ── Main loop ──────────────────────────────────────────────── */
 
+	/* Exit gesture: swipe up from bottom edge (touch displays) */
+	int swipe_active = 0;
+
 	while (running) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
 			if (ev.type == SDL_QUIT)
 				running = 0;
-			if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_q)
+			if (ev.type == SDL_KEYDOWN &&
+			    (ev.key.keysym.sym == SDLK_q ||
+			     ev.key.keysym.sym == SDLK_ESCAPE))
+				running = 0;
+			/* Swipe up from bottom edge to exit */
+			if (ev.type == SDL_FINGERDOWN && ev.tfinger.y > 0.9f)
+				swipe_active = 1;
+			if (ev.type == SDL_FINGERUP)
+				swipe_active = 0;
+			if (ev.type == SDL_FINGERMOTION && swipe_active &&
+			    ev.tfinger.y < 0.5f)
 				running = 0;
 		}
 

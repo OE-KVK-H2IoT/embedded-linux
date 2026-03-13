@@ -530,15 +530,25 @@ int main(int argc, char *argv[])
 	float roll = 0.0f, pitch = 0.0f;
 	float cpu_pct = 0.0f;
 
+	int swipe_active = 0;
+
 	while (g_running) {
 		/* --- events --- */
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
 			if (ev.type == SDL_QUIT ||
 			    (ev.type == SDL_KEYDOWN &&
-			     ev.key.keysym.sym == SDLK_ESCAPE)) {
+			     (ev.key.keysym.sym == SDLK_ESCAPE ||
+			      ev.key.keysym.sym == SDLK_q))) {
 				g_running = 0;
 			}
+			if (ev.type == SDL_FINGERDOWN && ev.tfinger.y > 0.9f)
+				swipe_active = 1;
+			if (ev.type == SDL_FINGERUP)
+				swipe_active = 0;
+			if (ev.type == SDL_FINGERMOTION && swipe_active &&
+			    ev.tfinger.y < 0.5f)
+				g_running = 0;
 			/* Keyboard fallback for missing sensors */
 			if (ev.type == SDL_KEYDOWN) {
 				switch (ev.key.keysym.sym) {

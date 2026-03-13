@@ -653,18 +653,28 @@ int main(int argc, char *argv[])
 
 	uint64_t prev_frame_ts = get_time_ns();
 
+	int swipe_active = 0;
+
 	while (g_running) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
 			if (ev.type == SDL_QUIT ||
 			    (ev.type == SDL_KEYDOWN &&
-			     ev.key.keysym.sym == SDLK_ESCAPE)) {
+			     (ev.key.keysym.sym == SDLK_ESCAPE ||
+			      ev.key.keysym.sym == SDLK_q))) {
 				g_running = 0;
 			}
 			if (ev.type == SDL_KEYDOWN &&
 			    ev.key.keysym.sym == SDLK_c) {
 				atomic_store(&g_calibrate, 1);
 			}
+			if (ev.type == SDL_FINGERDOWN && ev.tfinger.y > 0.9f)
+				swipe_active = 1;
+			if (ev.type == SDL_FINGERUP)
+				swipe_active = 0;
+			if (ev.type == SDL_FINGERMOTION && swipe_active &&
+			    ev.tfinger.y < 0.5f)
+				g_running = 0;
 		}
 
 		float roll  = atomic_load(&g_roll);
