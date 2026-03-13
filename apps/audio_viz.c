@@ -60,6 +60,7 @@ static snd_pcm_uframes_t period_frames = DEFAULT_FRAMES;
 static float mic_distance = DEFAULT_MIC_DIST;
 static float gain = DEFAULT_GAIN;
 static int wave_ms = DEFAULT_WAVE_MS;
+static int flip_dir = 0;          /* -f: flip direction 180° */
 
 /* Ring buffer: audio thread writes, render thread reads */
 static float *ring_buf;           /* [RING_SLOTS][channels * period_frames] */
@@ -436,8 +437,17 @@ static void draw_level_bar(SDL_Renderer *r, const char *label,
 	SDL_RenderDrawLine(r, peak_x, y0 + 1, peak_x, y0 + h - 1);
 }
 
+#define DIR_TRACE_LEN 32  /* number of trail dots */
+
+typedef struct {
+	float angle;
+	float conf;
+} dir_sample_t;
+
 static void draw_direction_indicator(SDL_Renderer *r, float angle_deg,
 				     float confidence,
+				     const dir_sample_t *trace, int trace_len,
+				     int trace_pos,
 				     int cx, int cy, int radius)
 {
 	/* Circle outline */
@@ -449,7 +459,31 @@ static void draw_direction_indicator(SDL_Renderer *r, float angle_deg,
 		SDL_RenderDrawPoint(r, px, py);
 	}
 
-	/* Direction line */
+	/* Fading trail — oldest to newest */
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	for (int i = 0; i < trace_len; i++) {
+		/* Oldest first: trace_pos is next write slot, so
+		 * trace_pos+0 = oldest, trace_pos-1 = newest */
+		int idx = (trace_pos + i) % trace_len;
+		float a = trace[idx].angle;
+		float c = trace[idx].conf;
+		if (c < 0.05f) continue;
+
+		float t = (float)(i + 1) / trace_len; /* 0→1, newest=1 */
+		int alpha = (int)(t * 120);
+		float trad = a * M_PI / 180.0f;
+		int tlen = (int)(radius * 0.85f * c);
+		int tx = cx + (int)(tlen * cosf(trad));
+		int ty = cy - (int)(tlen * sinf(trad));
+
+		SDL_SetRenderDrawColor(r, 255, 180, 50, alpha);
+		for (int dx = -2; dx <= 2; dx++)
+			for (int dy = -2; dy <= 2; dy++)
+				SDL_RenderDrawPoint(r, tx + dx, ty + dy);
+	}
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+	/* Current direction line */
 	float rad = angle_deg * M_PI / 180.0f;
 	int len = (int)(radius * confidence);
 	int ex = cx + (int)(len * cosf(rad));
@@ -458,7 +492,6 @@ static void draw_direction_indicator(SDL_Renderer *r, float angle_deg,
 	SDL_RenderDrawLine(r, cx, cy, ex, ey);
 
 	/* Arrow tip */
-	SDL_SetRenderDrawColor(r, 255, 200, 0, 255);
 	for (int dx = -3; dx <= 3; dx++)
 		for (int dy = -3; dy <= 3; dy++)
 			SDL_RenderDrawPoint(r, ex + dx, ey + dy);
@@ -570,6 +603,7 @@ static void usage(const char *prog)
 		"  -g GAIN     Software gain multiplier (default: %.1f)\n"
 		"  -w MS       Waveform display length in ms (default: %d)\n"
 		"  -m DIST     Mic distance in metres for DOA (default: %.3f)\n"
+		"  -f          Flip direction 180 deg (mics facing you)\n"
 		"  -h          Show this help\n",
 		prog, DEFAULT_DEVICE, DEFAULT_RATE, DEFAULT_CHANNELS,
 		(unsigned long)DEFAULT_FRAMES, DEFAULT_GAIN,
@@ -581,7 +615,7 @@ static void usage(const char *prog)
 int main(int argc, char *argv[])
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:h")) != -1) {
+	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:fh")) != -1) {
 		switch (opt) {
 		case 'd': alsa_device = optarg; break;
 		case 'r': sample_rate = atoi(optarg); break;
@@ -590,6 +624,7 @@ int main(int argc, char *argv[])
 		case 'g': gain = atof(optarg); break;
 		case 'w': wave_ms = atoi(optarg); break;
 		case 'm': mic_distance = atof(optarg); break;
+		case 'f': flip_dir = 1; break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
 	}
@@ -659,6 +694,7 @@ int main(int argc, char *argv[])
 	float hp_y1 = 0, hp_x1 = 0;
 	float hp_y2 = 0, hp_x2 = 0;
 	float hp_alpha = 0.995f; /* ~80 Hz cutoff at 48 kHz */
+	int warmup = 5; /* discard first N blocks to let HP filter settle */
 
 	/* Waveform history — circular buffer holding wave_ms of audio */
 	int wave_samples = (int)((float)wave_ms / 1000.0f * sample_rate);
@@ -701,6 +737,12 @@ int main(int argc, char *argv[])
 	float delay_samples = 0;
 	float angle_deg = 90;
 	float confidence = 0;
+
+	/* Direction trace ring buffer */
+	dir_sample_t dir_trace[DIR_TRACE_LEN];
+	memset(dir_trace, 0, sizeof(dir_trace));
+	int dir_trace_pos = 0;
+	int dir_trace_count = 0; /* frames between trace samples */
 
 	/* Smoothed stats for display */
 	float latency_avg = 0;
@@ -752,6 +794,10 @@ int main(int argc, char *argv[])
 			if (channels == 2)
 				highpass_1pole(ch2_buf, period_frames, &hp_y2,
 					       &hp_x2, hp_alpha);
+
+			/* Discard first blocks while HP filter settles
+			 * (avoids startup transient spike in waveform) */
+			if (warmup > 0) { warmup--; have_data = 0; continue; }
 
 			/* Append to waveform history */
 			for (int i = 0; i < (int)period_frames; i++) {
@@ -805,17 +851,29 @@ int main(int argc, char *argv[])
 					 gcc_inv_out);
 
 				int lag = find_peak_lag(corr, fft_size, max_lag);
-				delay_samples = delay_samples * 0.7f + lag * 0.3f;
+				delay_samples = delay_samples * 0.85f + lag * 0.15f;
 
 				float tau = delay_samples / sample_rate;
 				float sin_theta = SPEED_OF_SOUND * tau / mic_distance;
 				if (sin_theta > 1) sin_theta = 1;
 				if (sin_theta < -1) sin_theta = -1;
-				angle_deg = 90.0f - asinf(sin_theta) * 180.0f / M_PI;
+				float raw_angle = 90.0f - asinf(sin_theta) * 180.0f / M_PI;
+				if (flip_dir) raw_angle = 180.0f - raw_angle;
+
+				/* Heavier smoothing on displayed angle */
+				angle_deg = angle_deg * 0.92f + raw_angle * 0.08f;
 
 				/* Confidence from correlation peak */
 				float pk = corr[lag >= 0 ? lag : lag + fft_size];
 				confidence = pk > 0 ? (pk < 1 ? pk : 1) : 0;
+
+				/* Record trace every 3rd frame (~15 Hz) */
+				if (++dir_trace_count >= 3) {
+					dir_trace_count = 0;
+					dir_trace[dir_trace_pos].angle = angle_deg;
+					dir_trace[dir_trace_pos].conf = confidence;
+					dir_trace_pos = (dir_trace_pos + 1) % DIR_TRACE_LEN;
+				}
 			}
 		}
 
@@ -879,21 +937,9 @@ int main(int argc, char *argv[])
 		int y_left = y_cur;
 
 		if (stereo) {
-			/* Two separate spectrum panels: L then R */
-			int sh = 65;
-
-			/* "L" label */
-			SDL_SetRenderDrawColor(ren, 0, 200, 255, 255);
-			draw_text(ren, "L", margin + 2, y_left + 2, 1);
-			draw_spectrum(ren, mag_db, half_fft,
-				      margin, y_left, left_w, sh,
-				      db_floor, db_ceil, sample_rate, fft_size);
-			y_left += sh + 3;
-
-			/* "R" label */
-			SDL_SetRenderDrawColor(ren, 255, 150, 0, 255);
-			draw_text(ren, "R", margin + 2, y_left + 2, 1);
-			draw_spectrum(ren, mag_db2, half_fft,
+			/* Single averaged spectrum (L+R pick up same sound) */
+			int sh = 100;
+			draw_spectrum(ren, spec_avg, half_fft,
 				      margin, y_left, left_w, sh,
 				      db_floor, db_ceil, sample_rate, fft_size);
 			y_left += sh + 3;
@@ -992,6 +1038,8 @@ int main(int argc, char *argv[])
 			if (dir_cy + dir_r < WIN_H - margin) {
 				draw_direction_indicator(ren, angle_deg,
 							 confidence,
+							 dir_trace, DIR_TRACE_LEN,
+							 dir_trace_pos,
 							 dir_cx, dir_cy, dir_r);
 
 				/* Angle label below indicator */
