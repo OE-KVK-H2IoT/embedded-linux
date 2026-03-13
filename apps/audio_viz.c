@@ -858,7 +858,7 @@ int main(int argc, char *argv[])
 				if (sin_theta > 1) sin_theta = 1;
 				if (sin_theta < -1) sin_theta = -1;
 				float raw_angle = 90.0f - asinf(sin_theta) * 180.0f / M_PI;
-				if (flip_dir) raw_angle = 180.0f - raw_angle;
+				if (flip_dir) raw_angle = -raw_angle;
 
 				/* Heavier smoothing on displayed angle */
 				angle_deg = angle_deg * 0.92f + raw_angle * 0.08f;
