@@ -2,7 +2,7 @@
  * Main.qml - Car-style app launcher with swipeable pages
  *
  * Page 1: Apps     — Doom, Qt Dashboard, Ball Balance, Pong
- * Page 2: Demos    — SDL2 tutorial demos (Cube, Touch Paint, Level, etc.)
+ * Page 2: Demos    — SDL2 tutorial demos (Cube, Touch Paint, Level, Audio Viz, etc.)
  * Page 3: System   — CPU, memory, temperature, uptime, IP
  *
  * All app paths assume the embedded-linux repo is cloned to ~/embedded-linux.
@@ -188,6 +188,15 @@ Window {
                     label: "Spin Square"
                     accent: "#c878ff"
                     onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/solutions/sdl2-rotating-cube/build/step3_rotating_square")
+                }
+
+                AppButton {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    icon: "\u266B"
+                    label: "Audio Viz"
+                    accent: "#ff5090"
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/audio_viz -d hw:1,0 -c 2 -m 0.06 -f")
                 }
             }
         }
