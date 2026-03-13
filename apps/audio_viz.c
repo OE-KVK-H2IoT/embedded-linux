@@ -648,6 +648,11 @@ int main(int argc, char *argv[])
 	float angle_deg = 90;
 	float confidence = 0;
 
+	/* Smoothed stats for display */
+	float latency_avg = 0;
+	float rms_db_avg = -60;
+	float dom_freq_avg = 0;
+
 	/* Max lag for GCC-PHAT based on mic distance */
 	int max_lag = (int)(mic_distance / SPEED_OF_SOUND * sample_rate) + 10;
 	if (max_lag > fft_size / 2) max_lag = fft_size / 2;
@@ -798,35 +803,41 @@ int main(int argc, char *argv[])
 						 margin + dir_r + 10, dir_r);
 		}
 
-		/* Measure capture-to-display latency */
+		/* Measure capture-to-display latency (moving average) */
 		struct timespec now;
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		float latency_ms = 0;
 		if (capture_ts.tv_sec > 0) {
-			latency_ms = (now.tv_sec - capture_ts.tv_sec) * 1000.0f +
-				     (now.tv_nsec - capture_ts.tv_nsec) / 1e6f;
+			float lat_raw = (now.tv_sec - capture_ts.tv_sec) * 1000.0f +
+					(now.tv_nsec - capture_ts.tv_nsec) / 1e6f;
+			latency_avg = latency_avg * 0.9f + lat_raw * 0.1f;
 		}
 
-		/* On-screen stats */
-		float rms_display = compute_rms(ch1_buf, period_frames);
-		float rms_db_val = 20.0f * log10f(rms_display + 1e-10f);
-		/* Find dominant frequency */
-		int peak_bin = 0;
+		/* Smoothed RMS */
+		float rms_now = compute_rms(ch1_buf, period_frames);
+		float rms_db_now = 20.0f * log10f(rms_now + 1e-10f);
+		rms_db_avg = rms_db_avg * 0.85f + rms_db_now * 0.15f;
+
+		/* Find dominant frequency — skip DC area and top 5% (noise) */
+		int bin_min = (int)(80.0f / ((float)sample_rate / fft_size));
+		int bin_max = half_fft * 95 / 100;
+		if (bin_min < 1) bin_min = 1;
+		int peak_bin = bin_min;
 		float peak_mag = -200;
-		for (int i = 1; i < half_fft; i++) {
+		for (int i = bin_min; i < bin_max; i++) {
 			if (mag_db[i] > peak_mag) {
 				peak_mag = mag_db[i];
 				peak_bin = i;
 			}
 		}
-		float dom_freq = (float)peak_bin * sample_rate / fft_size;
+		float dom_freq_now = (float)peak_bin * sample_rate / fft_size;
+		dom_freq_avg = dom_freq_avg * 0.8f + dom_freq_now * 0.2f;
 
 		/* Fixed-width labels + values so text doesn't jump */
 		char line1[64], line2[64];
 		snprintf(line1, sizeof(line1), "Latency %6.1f ms   RMS %6.1f dB",
-			 latency_ms, rms_db_val);
+			 latency_avg, rms_db_avg);
 		snprintf(line2, sizeof(line2), "Freq  %6d Hz   Gain  %5.1fx",
-			 (int)dom_freq, gain);
+			 (int)dom_freq_avg, gain);
 
 		int txt_scale = 2;
 		int line_h = (FONT_H + 2) * txt_scale;
