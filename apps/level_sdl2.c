@@ -570,6 +570,8 @@ int main(int argc, char *argv[])
 	SDL_Renderer *ren = SDL_CreateRenderer(
 		win, -1,
 		SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+	if (getenv("HIDE_CURSOR"))
+		SDL_ShowCursor(SDL_DISABLE);
 	if (!ren) {
 		fprintf(stderr, "SDL_CreateRenderer failed: %s\n",
 			SDL_GetError());

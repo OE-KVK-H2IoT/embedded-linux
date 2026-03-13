@@ -73,6 +73,7 @@ int main(int argc, char **argv)
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!ren) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
     if (!ren) { fprintf(stderr, "Renderer: %s\n", SDL_GetError()); return 1; }
+    if (getenv("HIDE_CURSOR")) SDL_ShowCursor(SDL_DISABLE);
 
     /* Canvas texture — we draw strokes here and keep them */
     SDL_Texture *canvas = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA8888,

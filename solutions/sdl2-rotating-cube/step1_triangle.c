@@ -79,6 +79,7 @@ int main(int argc, char **argv)
         SDL_DestroyWindow(win); SDL_Quit(); return 1;
     }
     SDL_GL_SetSwapInterval(1);  /* VSync ON */
+    if (getenv("HIDE_CURSOR")) SDL_ShowCursor(SDL_DISABLE);
 
     printf("GL Renderer: %s\n", glGetString(GL_RENDERER));
     printf("GL Version:  %s\n", glGetString(GL_VERSION));

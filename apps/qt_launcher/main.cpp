@@ -28,6 +28,7 @@
 #include <QTextStream>
 #include <QDir>
 #include <QWindow>
+#include <QCursor>
 #include <QSurfaceFormat>
 #include <QNetworkInterface>
 
@@ -44,12 +45,14 @@ class LaunchManager : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(bool childRunning READ childRunning NOTIFY childRunningChanged)
+    Q_PROPERTY(bool touchMode READ touchMode CONSTANT)
 
 public:
-    explicit LaunchManager(QObject *parent = nullptr)
-        : QObject(parent) {}
+    explicit LaunchManager(bool touch, QObject *parent = nullptr)
+        : QObject(parent), m_touchMode(touch) {}
 
     bool childRunning() const { return m_childRunning; }
+    bool touchMode() const { return m_touchMode; }
 
     Q_INVOKABLE void launch(const QString &command) {
         if (m_childRunning) return;
@@ -80,7 +83,10 @@ public:
             emit childFinished(code);
         });
 
-        m_process->start("/bin/sh", {"-c", command});
+        QString cmd = command;
+        if (m_touchMode)
+            cmd = "HIDE_CURSOR=1 " + cmd;
+        m_process->start("/bin/sh", {"-c", cmd});
 
         /* Write child PID so the home-button daemon can send SIGTERM */
         QFile pidFile("/tmp/launcher_child.pid");
@@ -150,6 +156,7 @@ private:
     QProcess *m_process = nullptr;
     QList<int> m_drmFds;
     bool m_childRunning = false;
+    bool m_touchMode = false;
 };
 
 /* ── SystemInfo ─────────────────────────────────────────────── */
@@ -295,10 +302,20 @@ int main(int argc, char *argv[])
     fmt.setSamples(4);
     QSurfaceFormat::setDefaultFormat(fmt);
 
+    /* Parse -t (touch mode: hide cursor for all apps) */
+    bool touchMode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-t") == 0)
+            touchMode = true;
+    }
+
     QGuiApplication app(argc, argv);
     app.setFont(QFont("Sans", 14));  /* ensure clean default font */
 
-    LaunchManager launcher;
+    if (touchMode)
+        QGuiApplication::setOverrideCursor(Qt::BlankCursor);
+
+    LaunchManager launcher(touchMode);
     SystemInfo sysinfo;
 
     QQmlApplicationEngine engine;

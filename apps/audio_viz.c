@@ -329,8 +329,8 @@ static void draw_spectrum(SDL_Renderer *r, const float *mag_db, int bins,
 	float db_range = db_ceil - db_floor;
 	float nyquist = srate / 2.0f;
 
-	for (int i = 0; i < w && i < bins; i++) {
-		int bin = i * bins / w;
+	for (int i = 0; i < w; i++) {
+		int bin = i * (bins - 1) / w;
 		float norm = (mag_db[bin] - db_floor) / db_range;
 		if (norm < 0) norm = 0;
 		if (norm > 1) norm = 1;
@@ -714,7 +714,8 @@ int main(int argc, char *argv[])
 		WIN_W, WIN_H, 0);
 	SDL_Renderer *ren = SDL_CreateRenderer(win, -1,
 		SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-	SDL_ShowCursor(SDL_DISABLE);
+	if (getenv("HIDE_CURSOR"))
+		SDL_ShowCursor(SDL_DISABLE);
 
 	/* Spectrogram texture */
 	int spec_h = 150;
