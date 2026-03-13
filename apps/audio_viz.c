@@ -665,7 +665,8 @@ int main(int argc, char *argv[])
 	if (wave_samples > MAX_WAVE_SAMPLES) wave_samples = MAX_WAVE_SAMPLES;
 	float *wave_hist1 = calloc(wave_samples, sizeof(float));
 	float *wave_hist2 = channels == 2 ? calloc(wave_samples, sizeof(float)) : NULL;
-	int wave_pos = 0; /* write cursor in circular buffer */
+	int wave_pos = 0;   /* write cursor in circular buffer */
+	int wave_filled = 0; /* how many samples have been written total */
 
 	printf("Waveform: %d ms = %d samples\n", wave_ms, wave_samples);
 
@@ -755,6 +756,8 @@ int main(int argc, char *argv[])
 					wave_hist2[wave_pos] = ch2_buf[i];
 				wave_pos = (wave_pos + 1) % wave_samples;
 			}
+			wave_filled += (int)period_frames;
+			if (wave_filled > wave_samples) wave_filled = wave_samples;
 
 			/* FFT of channel 1 */
 			apply_hann_window(ch1_buf, windowed, fft_size);
@@ -803,28 +806,31 @@ int main(int argc, char *argv[])
 		int margin = 10;
 		int panel_w = WIN_W - 2 * margin;
 
-		/* Waveform: top area — linearize circular history buffer */
+		/* Waveform: top area — linearize circular history buffer.
+		 * Only draw the filled portion to avoid zero-gap spikes. */
 		int wave_h = channels == 2 ? 70 : 100;
-		{
-			/* Oldest sample is at wave_pos, newest at wave_pos-1 */
-			float *lin1 = malloc(wave_samples * sizeof(float));
-			for (int i = 0; i < wave_samples; i++)
-				lin1[i] = wave_hist1[(wave_pos + i) % wave_samples];
-			draw_waveform(ren, lin1, wave_samples,
+		int draw_n = wave_filled < wave_samples ? wave_filled : wave_samples;
+		if (draw_n > 0) {
+			/* Start reading from (wave_pos - draw_n), wrapping */
+			int start = (wave_pos - draw_n + wave_samples) % wave_samples;
+			float *lin1 = malloc(draw_n * sizeof(float));
+			for (int i = 0; i < draw_n; i++)
+				lin1[i] = wave_hist1[(start + i) % wave_samples];
+			draw_waveform(ren, lin1, draw_n,
 				      margin, margin, panel_w, wave_h,
 				      0, 200, 255);
 			free(lin1);
-		}
 
-		if (channels == 2) {
-			float *lin2 = malloc(wave_samples * sizeof(float));
-			for (int i = 0; i < wave_samples; i++)
-				lin2[i] = wave_hist2[(wave_pos + i) % wave_samples];
-			draw_waveform(ren, lin2, wave_samples,
-				      margin, margin + wave_h + 5,
-				      panel_w, wave_h,
-				      255, 150, 0);
-			free(lin2);
+			if (channels == 2) {
+				float *lin2 = malloc(draw_n * sizeof(float));
+				for (int i = 0; i < draw_n; i++)
+					lin2[i] = wave_hist2[(start + i) % wave_samples];
+				draw_waveform(ren, lin2, draw_n,
+					      margin, margin + wave_h + 5,
+					      panel_w, wave_h,
+					      255, 150, 0);
+				free(lin2);
+			}
 		}
 
 		int y_after_wave = margin + (channels == 2 ? 2 * wave_h + 10 : wave_h + 5);
