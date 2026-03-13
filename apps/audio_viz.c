@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 #include <getopt.h>
 
 #include <alsa/asoundlib.h>
@@ -59,6 +60,7 @@ static float gain = DEFAULT_GAIN;
 
 /* Ring buffer: audio thread writes, render thread reads */
 static float *ring_buf;           /* [RING_SLOTS][channels * period_frames] */
+static struct timespec ring_ts[RING_SLOTS]; /* capture timestamp per slot */
 static int ring_write = 0;
 static int ring_read  = 0;
 static pthread_mutex_t ring_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -229,6 +231,7 @@ static void *audio_thread(void *arg)
 			tmp[i] = (float)raw_buf[i] / 2147483648.0f * gain;
 
 		pthread_mutex_lock(&ring_mtx);
+		clock_gettime(CLOCK_MONOTONIC, &ring_ts[ring_write]);
 		memcpy(ring_buf + ring_write * slot_size, tmp,
 		       n * channels * sizeof(float));
 		ring_write = (ring_write + 1) % RING_SLOTS;
@@ -395,6 +398,48 @@ static void draw_direction_indicator(SDL_Renderer *r, float angle_deg,
 			SDL_RenderDrawPoint(r, ex + dx, ey + dy);
 }
 
+/* ── Tiny 3x5 digit font for on-screen stats ───────────────────────── */
+
+static const uint8_t font3x5[128][5] = {
+	['0'] = {0x7,0x5,0x5,0x5,0x7}, ['1'] = {0x2,0x6,0x2,0x2,0x7},
+	['2'] = {0x7,0x1,0x7,0x4,0x7}, ['3'] = {0x7,0x1,0x7,0x1,0x7},
+	['4'] = {0x5,0x5,0x7,0x1,0x1}, ['5'] = {0x7,0x4,0x7,0x1,0x7},
+	['6'] = {0x7,0x4,0x7,0x5,0x7}, ['7'] = {0x7,0x1,0x1,0x1,0x1},
+	['8'] = {0x7,0x5,0x7,0x5,0x7}, ['9'] = {0x7,0x5,0x7,0x1,0x7},
+	['.'] = {0x0,0x0,0x0,0x0,0x2}, ['m'] = {0x0,0x5,0x7,0x5,0x5},
+	['s'] = {0x7,0x4,0x7,0x1,0x7}, ['k'] = {0x5,0x6,0x4,0x6,0x5},
+	['H'] = {0x5,0x5,0x7,0x5,0x5}, ['z'] = {0x7,0x1,0x2,0x4,0x7},
+	['L'] = {0x4,0x4,0x4,0x4,0x7}, ['a'] = {0x7,0x5,0x7,0x5,0x5},
+	['t'] = {0x7,0x2,0x2,0x2,0x2}, [':'] = {0x0,0x2,0x0,0x2,0x0},
+	[' '] = {0x0,0x0,0x0,0x0,0x0}, ['d'] = {0x1,0x1,0x7,0x5,0x7},
+	['B'] = {0x6,0x5,0x6,0x5,0x6}, ['R'] = {0x6,0x5,0x6,0x5,0x5},
+	['M'] = {0x5,0x7,0x7,0x5,0x5}, ['F'] = {0x7,0x4,0x6,0x4,0x4},
+	['P'] = {0x7,0x5,0x7,0x4,0x4}, ['G'] = {0x7,0x4,0x5,0x5,0x7},
+	['N'] = {0x5,0x5,0x7,0x7,0x5}, ['-'] = {0x0,0x0,0x7,0x0,0x0},
+};
+
+static void draw_text(SDL_Renderer *r, const char *str,
+		      int x0, int y0, int scale)
+{
+	int cx = x0;
+	for (const char *p = str; *p; p++) {
+		int ch = (unsigned char)*p;
+		if (ch >= 128) ch = ' ';
+		for (int row = 0; row < 5; row++) {
+			uint8_t bits = font3x5[ch][row];
+			for (int col = 0; col < 3; col++) {
+				if (bits & (0x4 >> col)) {
+					SDL_Rect px = { cx + col * scale,
+							y0 + row * scale,
+							scale, scale };
+					SDL_RenderFillRect(r, &px);
+				}
+			}
+		}
+		cx += 4 * scale;
+	}
+}
+
 /* ── Signal handler ─────────────────────────────────────────────────── */
 
 static void handle_signal(int sig) { (void)sig; running = 0; }
@@ -548,9 +593,11 @@ int main(int argc, char *argv[])
 
 		/* Read latest audio block from ring buffer */
 		int have_data = 0;
+		struct timespec capture_ts = {0, 0};
 		pthread_mutex_lock(&ring_mtx);
 		if (ring_read != ring_write) {
 			float *src = ring_buf + ring_read * slot_size;
+			capture_ts = ring_ts[ring_read];
 			/* De-interleave */
 			for (int i = 0; i < (int)period_frames; i++) {
 				ch1_buf[i] = src[i * channels];
@@ -673,6 +720,36 @@ int main(int argc, char *argv[])
 						 WIN_W - margin - dir_r - 10,
 						 margin + dir_r + 10, dir_r);
 		}
+
+		/* Measure capture-to-display latency */
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		float latency_ms = 0;
+		if (capture_ts.tv_sec > 0) {
+			latency_ms = (now.tv_sec - capture_ts.tv_sec) * 1000.0f +
+				     (now.tv_nsec - capture_ts.tv_nsec) / 1e6f;
+		}
+
+		/* On-screen stats */
+		char stats[128];
+		float rms_display = compute_rms(ch1_buf, period_frames);
+		float rms_db_val = 20.0f * log10f(rms_display + 1e-10f);
+		/* Find dominant frequency */
+		int peak_bin = 0;
+		float peak_mag = -200;
+		for (int i = 1; i < half_fft; i++) {
+			if (mag_db[i] > peak_mag) {
+				peak_mag = mag_db[i];
+				peak_bin = i;
+			}
+		}
+		float dom_freq = (float)peak_bin * sample_rate / fft_size;
+
+		snprintf(stats, sizeof(stats), "Lat:%.1fms RMs:%.1fdB F:%dHz G:%.0f",
+			 latency_ms, rms_db_val, (int)dom_freq, gain);
+
+		SDL_SetRenderDrawColor(ren, 200, 200, 200, 255);
+		draw_text(ren, stats, margin, y_after_wave, 2);
 
 		SDL_RenderPresent(ren);
 	}
