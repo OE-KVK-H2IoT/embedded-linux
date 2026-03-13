@@ -650,6 +650,7 @@ int main(int argc, char *argv[])
 	}
 
 	float *mag_db = calloc(half_fft, sizeof(float));
+	float *mag_db2 = channels == 2 ? calloc(half_fft, sizeof(float)) : NULL;
 	float *ch1_buf = calloc(period_frames, sizeof(float));
 	float *ch2_buf = channels == 2 ? calloc(period_frames, sizeof(float)) : NULL;
 	float *windowed = calloc(fft_size, sizeof(float));
@@ -765,6 +766,14 @@ int main(int argc, char *argv[])
 			fftwf_execute(plan_fwd);
 			compute_magnitude_db(fft_out, mag_db, fft_size);
 
+			/* FFT of channel 2 */
+			if (channels == 2) {
+				apply_hann_window(ch2_buf, windowed, fft_size);
+				memcpy(fft_in, windowed, fft_size * sizeof(float));
+				fftwf_execute(plan_fwd);
+				compute_magnitude_db(fft_out, mag_db2, fft_size);
+			}
+
 			/* Spectrogram column */
 			draw_spectrogram_col(spec_tex, mag_db, half_fft,
 					     spec_col, spec_h, db_floor, db_ceil);
@@ -841,11 +850,39 @@ int main(int argc, char *argv[])
 			       margin, y_after_wave, panel_w, 15);
 		y_after_wave += 20;
 
-		/* FFT spectrum */
+		/* Ch2 level meter (stereo only) */
+		if (channels == 2) {
+			float rms2 = compute_rms(ch2_buf, period_frames);
+			float peak2 = compute_peak(ch2_buf, period_frames);
+			draw_level_bar(ren, "R", rms2, peak2,
+				       margin, y_after_wave, panel_w, 15);
+			y_after_wave += 20;
+		}
+
+		/* FFT spectrum — ch1 (cyan bars) */
 		int spec_bar_h = 100;
 		draw_spectrum(ren, mag_db, half_fft,
 			      margin, y_after_wave, panel_w, spec_bar_h,
 			      db_floor, db_ceil, sample_rate, fft_size);
+
+		/* Ch2 spectrum overlay (orange, semi-transparent look via thinner bars) */
+		if (channels == 2 && mag_db2) {
+			float db_range = db_ceil - db_floor;
+			SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+			for (int i = 0; i < panel_w && i < half_fft; i++) {
+				int bin = i * half_fft / panel_w;
+				float norm = (mag_db2[bin] - db_floor) / db_range;
+				if (norm < 0) norm = 0;
+				if (norm > 1) norm = 1;
+				int bar_h2 = (int)(norm * spec_bar_h);
+				SDL_SetRenderDrawColor(ren, 255, 140, 30, 140);
+				SDL_RenderDrawLine(ren, margin + i,
+						   y_after_wave + spec_bar_h - bar_h2,
+						   margin + i,
+						   y_after_wave + spec_bar_h);
+			}
+			SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+		}
 		y_after_wave += spec_bar_h + 5;
 
 		/* Spectrogram — render scrolled so current column is rightmost */
@@ -947,6 +984,7 @@ int main(int argc, char *argv[])
 	}
 
 	free(mag_db);
+	free(mag_db2);
 	free(ch1_buf);
 	free(ch2_buf);
 	free(windowed);
