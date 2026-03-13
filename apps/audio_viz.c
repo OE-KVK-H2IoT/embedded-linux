@@ -43,6 +43,7 @@
 
 #define SPEED_OF_SOUND    343.0f    /* m/s */
 #define DEFAULT_MIC_DIST  0.06f     /* 6 cm default mic spacing */
+#define DEFAULT_GAIN      4.0f      /* software gain (I2S mics are often quiet) */
 
 /* ── Globals ────────────────────────────────────────────────────────── */
 
@@ -54,6 +55,7 @@ static unsigned int sample_rate = DEFAULT_RATE;
 static unsigned int channels = DEFAULT_CHANNELS;
 static snd_pcm_uframes_t period_frames = DEFAULT_FRAMES;
 static float mic_distance = DEFAULT_MIC_DIST;
+static float gain = DEFAULT_GAIN;
 
 /* Ring buffer: audio thread writes, render thread reads */
 static float *ring_buf;           /* [RING_SLOTS][channels * period_frames] */
@@ -220,10 +222,11 @@ static void *audio_thread(void *arg)
 			continue;
 		}
 
-		/* Convert S32_LE to float [-1.0, 1.0]
-		 * I2S mics output 24-bit data in upper bits of 32-bit word */
+		/* Convert S32_LE to float and apply gain.
+		 * I2S mics output 24-bit data in upper bits of 32-bit word,
+		 * so the raw signal is often quiet — gain compensates. */
 		for (int i = 0; i < (int)(n * channels); i++)
-			tmp[i] = (float)raw_buf[i] / 2147483648.0f;
+			tmp[i] = (float)raw_buf[i] / 2147483648.0f * gain;
 
 		pthread_mutex_lock(&ring_mtx);
 		memcpy(ring_buf + ring_write * slot_size, tmp,
@@ -406,10 +409,11 @@ static void usage(const char *prog)
 		"  -r RATE     Sample rate (default: %u)\n"
 		"  -c CHANS    Channels: 1 or 2 (default: %u)\n"
 		"  -n FRAMES   Period/FFT size (default: %lu)\n"
+		"  -g GAIN     Software gain multiplier (default: %.1f)\n"
 		"  -m DIST     Mic distance in metres for DOA (default: %.3f)\n"
 		"  -h          Show this help\n",
 		prog, DEFAULT_DEVICE, DEFAULT_RATE, DEFAULT_CHANNELS,
-		(unsigned long)DEFAULT_FRAMES, DEFAULT_MIC_DIST);
+		(unsigned long)DEFAULT_FRAMES, DEFAULT_GAIN, DEFAULT_MIC_DIST);
 }
 
 /* ── Main ───────────────────────────────────────────────────────────── */
@@ -417,12 +421,13 @@ static void usage(const char *prog)
 int main(int argc, char *argv[])
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "d:r:c:n:m:h")) != -1) {
+	while ((opt = getopt(argc, argv, "d:r:c:n:g:m:h")) != -1) {
 		switch (opt) {
 		case 'd': alsa_device = optarg; break;
 		case 'r': sample_rate = atoi(optarg); break;
 		case 'c': channels = atoi(optarg); break;
 		case 'n': period_frames = atoi(optarg); break;
+		case 'g': gain = atof(optarg); break;
 		case 'm': mic_distance = atof(optarg); break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
