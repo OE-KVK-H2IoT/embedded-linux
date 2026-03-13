@@ -246,6 +246,11 @@ static void *audio_thread(void *arg)
 	return NULL;
 }
 
+/* ── Forward declarations ───────────────────────────────────────────── */
+
+static void draw_text(SDL_Renderer *r, const char *str,
+		      int x0, int y0, int scale);
+
 /* ── Drawing helpers ────────────────────────────────────────────────── */
 
 static void draw_waveform(SDL_Renderer *r, const float *buf, int n,
@@ -276,7 +281,8 @@ static void draw_waveform(SDL_Renderer *r, const float *buf, int n,
 
 static void draw_spectrum(SDL_Renderer *r, const float *mag_db, int bins,
 			  int x0, int y0, int w, int h,
-			  float db_floor, float db_ceil)
+			  float db_floor, float db_ceil,
+			  unsigned int srate, int fft_n)
 {
 	/* Border */
 	SDL_SetRenderDrawColor(r, 60, 60, 60, 255);
@@ -284,6 +290,7 @@ static void draw_spectrum(SDL_Renderer *r, const float *mag_db, int bins,
 	SDL_RenderDrawRect(r, &border);
 
 	float db_range = db_ceil - db_floor;
+	float nyquist = srate / 2.0f;
 
 	for (int i = 0; i < w && i < bins; i++) {
 		int bin = i * bins / w;
@@ -306,6 +313,29 @@ static void draw_spectrum(SDL_Renderer *r, const float *mag_db, int bins,
 
 		SDL_SetRenderDrawColor(r, cr, cg, cb, 255);
 		SDL_RenderDrawLine(r, x0 + i, y0 + h - bar_h, x0 + i, y0 + h);
+	}
+
+	/* Frequency axis labels */
+	float freq_ticks[] = {100, 500, 1000, 2000, 5000, 10000, 20000};
+	int n_ticks = sizeof(freq_ticks) / sizeof(freq_ticks[0]);
+	for (int t = 0; t < n_ticks; t++) {
+		if (freq_ticks[t] > nyquist) break;
+		int px = (int)(freq_ticks[t] / nyquist * w);
+		if (px < 0 || px >= w) continue;
+
+		/* Tick mark */
+		SDL_SetRenderDrawColor(r, 80, 80, 80, 255);
+		SDL_RenderDrawLine(r, x0 + px, y0, x0 + px, y0 + h);
+
+		/* Label */
+		char lbl[16];
+		if (freq_ticks[t] >= 1000)
+			snprintf(lbl, sizeof(lbl), "%dk", (int)(freq_ticks[t] / 1000));
+		else
+			snprintf(lbl, sizeof(lbl), "%d", (int)freq_ticks[t]);
+
+		SDL_SetRenderDrawColor(r, 120, 130, 140, 255);
+		draw_text(r, lbl, x0 + px + 2, y0 + 2, 1);
 	}
 }
 
@@ -735,7 +765,7 @@ int main(int argc, char *argv[])
 		int spec_bar_h = 100;
 		draw_spectrum(ren, mag_db, half_fft,
 			      margin, y_after_wave, panel_w, spec_bar_h,
-			      db_floor, db_ceil);
+			      db_floor, db_ceil, sample_rate, fft_size);
 		y_after_wave += spec_bar_h + 5;
 
 		/* Spectrogram — render scrolled so current column is rightmost */
