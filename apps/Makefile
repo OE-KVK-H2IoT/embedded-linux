@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS = -Wall -O2 $(shell sdl2-config --cflags)
 LDFLAGS = $(shell sdl2-config --libs) -lm -lpthread
 
-all: level_sdl2 sdl2_dashboard pong_fb iio_capture audio_viz
+all: level_sdl2 sdl2_dashboard pong_fb iio_capture audio_viz audio_viz_full
 
 level_sdl2: level_sdl2.c jitter_logger.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -22,5 +22,8 @@ iio_capture: iio_capture.c
 audio_viz: audio_viz.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lasound -lfftw3f
 
+audio_viz_full: audio_viz_full.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lasound -lfftw3f
+
 clean:
-	rm -f level_sdl2 sdl2_dashboard atomic_sensor pong_fb iio_capture audio_viz
+	rm -f level_sdl2 sdl2_dashboard atomic_sensor pong_fb iio_capture audio_viz audio_viz_full

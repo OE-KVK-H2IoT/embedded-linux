@@ -198,6 +198,15 @@ Window {
                     accent: "#ff5090"
                     onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/audio_viz -d hw:1,0 -c 2 -m 0.06 -f")
                 }
+
+                AppButton {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    icon: "\u266A"
+                    label: "Audio Full"
+                    accent: "#c050ff"
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/audio_viz_full -d hw:1,0 -c 2 -m 0.06 -f")
+                }
             }
         }
 
