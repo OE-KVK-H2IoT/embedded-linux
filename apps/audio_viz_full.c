@@ -229,7 +229,7 @@ static void freq_to_note(float freq, char *buf, int buflen)
 	int octave = 4 + (nearest + 9) / 12;
 	if (nearest + 9 < 0)
 		octave = 4 + (nearest + 9 - 11) / 12;
-	snprintf(buf, buflen, "%2s%d %+3.0fc",
+	snprintf(buf, buflen, "%s%d %+.0fc",
 		 note_names[note_idx], octave, cents);
 }
 
