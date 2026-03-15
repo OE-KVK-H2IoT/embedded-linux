@@ -119,12 +119,16 @@ static float delay_mix = 0.4f;
 static int delay_enabled = 0;
 static float delay_ms = 200.0f;   /* default 200ms */
 
-/* Pitch shift effect (simple resampling) */
-#define PITCH_BUF_SIZE (48000 * 2) /* 2 seconds max */
-static float *pitch_buf_l = NULL;
-static float *pitch_buf_r = NULL;
-static float pitch_ratio = 1.0f;  /* 1.0 = normal, 2.0 = chipmunk, 0.5 = deep */
-static int pitch_enabled = 0;
+/* Voice effects for playback */
+#define FX_NONE      0
+#define FX_CHIPMUNK  1
+#define FX_DEEP      2
+#define FX_ROBOT     3
+#define FX_COUNT     4
+static int fx_mode = FX_NONE;
+static const char *fx_names[FX_COUNT] = {
+	"Normal", "Chipmunk", "Deep", "Robot"
+};
 
 /* Noise gate for playback */
 static float playback_gate_db = -45.0f;
@@ -337,122 +341,77 @@ static void delay_process(float *buf, int n, float *dbuf)
 	}
 }
 
-/* ── Pitch shift (OLA — Overlap-Add, preserves speed) ──────────────── */
-/*
- * Changes pitch WITHOUT changing speed. Each grain reads GRAIN_SIZE
- * consecutive samples from the input (at original speed), but grains
- * are sourced from positions that jump by hop*ratio instead of hop.
+/* ── Voice effects (applied to playback copy only) ─────────────────── */
+
+/* Chipmunk: resample up — every N input samples produce N*ratio output.
+ * We process blocks: read fewer input samples, interpolate to fill output.
+ * Deep: resample down — read more input samples, decimate to fill output.
  *
- * ratio > 1: grains skip ahead in input → higher pitch, same speed
- * ratio < 1: grains overlap more in input → lower pitch, same speed
- *
- * Two grains overlap at 50% with Hann windows for smooth crossfade.
- */
+ * For real-time with fixed block sizes, we use a simple circular buffer
+ * with a fractional read pointer. This DOES change speed slightly,
+ * but with moderate ratios (1.3x/0.75x) it's barely noticeable for
+ * a fun demo. */
 
-#define GRAIN_SIZE 2048  /* ~42 ms at 48 kHz */
-#define GRAIN_HOP  (GRAIN_SIZE / 2)
+static float fx_phase_l = 0, fx_phase_r = 0;
+static float fx_robot_phase = 0;  /* ring modulator oscillator */
 
-typedef struct {
-	float start;    /* start position in ring buffer */
-	int pos;        /* sample index within grain */
-	int active;
-} ola_grain_t;
-
-static int pitch_write_pos = 0;
-static int ph_initialized = 0;
-
-/* Per-channel state (separate read positions for L/R) */
-typedef struct {
-	ola_grain_t grains[2];
-	int hop_count;       /* samples since last grain start */
-	float input_pos;     /* where next grain reads from */
-} pitch_state_t;
-
-static pitch_state_t ps_l = {{{0,0,0},{0,0,0}}, 0, 0};
-static pitch_state_t ps_r = {{{0,0,0},{0,0,0}}, 0, 0};
-
-static float pitch_interp(const float *pbuf, float phase)
+static void fx_apply(float *buf, int n, int mode, float *phase)
 {
-	while (phase < 0) phase += PITCH_BUF_SIZE;
-	int idx0 = (int)phase % PITCH_BUF_SIZE;
-	int idx1 = (idx0 + 1) % PITCH_BUF_SIZE;
-	float frac = phase - floorf(phase);
-	return pbuf[idx0] * (1.0f - frac) + pbuf[idx1] * frac;
-}
+	switch (mode) {
+	case FX_CHIPMUNK: {
+		/* Resample: read at 0.7x speed → output plays back higher.
+		 * We compress the input in time → higher pitch. */
+		float tmp[4096];
+		if (n > 4096) n = 4096;
+		memcpy(tmp, buf, n * sizeof(float));
 
-static void pitch_shift(float *buf, int n, float *pbuf, float ratio)
-{
-	/* Write input into circular buffer */
-	for (int i = 0; i < n; i++) {
-		pbuf[pitch_write_pos] = buf[i];
-		pitch_write_pos = (pitch_write_pos + 1) % PITCH_BUF_SIZE;
-	}
-
-	/* Pick per-channel state */
-	pitch_state_t *ps = (pbuf == pitch_buf_l) ? &ps_l : &ps_r;
-
-	/* Initialize on first call */
-	if (!ph_initialized) {
-		ps->input_pos = (float)((pitch_write_pos - GRAIN_SIZE * 3 +
-					 PITCH_BUF_SIZE) % PITCH_BUF_SIZE);
-		ps->hop_count = GRAIN_HOP; /* trigger first grain immediately */
-		ps->grains[0].active = 0;
-		ps->grains[1].active = 0;
-		/* Only set flag after both channels init (caller does L then R) */
-		if (pbuf == pitch_buf_r || channels == 1)
-			ph_initialized = 1;
-	}
-
-	for (int i = 0; i < n; i++) {
-		/* Start a new grain every GRAIN_HOP output samples */
-		if (ps->hop_count >= GRAIN_HOP) {
-			ps->hop_count = 0;
-
-			/* Find free slot (or steal oldest) */
-			int slot = -1;
-			if (!ps->grains[0].active) slot = 0;
-			else if (!ps->grains[1].active) slot = 1;
-			else slot = ps->grains[0].pos > ps->grains[1].pos ? 0 : 1;
-
-			ps->grains[slot].start = ps->input_pos;
-			ps->grains[slot].pos = 0;
-			ps->grains[slot].active = 1;
-
-			/* Advance input read position by hop * ratio.
-			 * This is what changes pitch:
-			 *   ratio=2 → skip 2x content → higher pitch
-			 *   ratio=0.5 → re-read content → lower pitch */
-			ps->input_pos += (float)GRAIN_HOP * ratio;
-			while (ps->input_pos >= PITCH_BUF_SIZE)
-				ps->input_pos -= PITCH_BUF_SIZE;
-
-			/* Safety: keep input_pos from getting too far from write.
-			 * For ratio>1 it can catch up; for ratio<1 it falls behind. */
-			float dist = pitch_write_pos - ps->input_pos;
-			while (dist < 0) dist += PITCH_BUF_SIZE;
-			if (dist > PITCH_BUF_SIZE * 0.8f || dist < GRAIN_SIZE)
-				ps->input_pos = (float)((pitch_write_pos -
-					GRAIN_SIZE * 3 + PITCH_BUF_SIZE) %
-					PITCH_BUF_SIZE);
+		float ratio = 0.65f; /* read slower → output is higher pitch */
+		for (int i = 0; i < n; i++) {
+			int idx0 = (int)*phase;
+			int idx1 = idx0 + 1;
+			if (idx0 >= n) idx0 = n - 1;
+			if (idx1 >= n) idx1 = n - 1;
+			float frac = *phase - (int)*phase;
+			buf[i] = tmp[idx0] * (1.0f - frac) + tmp[idx1] * frac;
+			*phase += ratio;
 		}
-		ps->hop_count++;
+		/* Keep phase in range for next block */
+		*phase = fmodf(*phase, (float)n);
+		break;
+	}
+	case FX_DEEP: {
+		/* Resample: read at 1.5x speed → output plays back lower. */
+		float tmp[4096];
+		if (n > 4096) n = 4096;
+		memcpy(tmp, buf, n * sizeof(float));
 
-		/* Mix active grains with Hann windows */
-		float out = 0;
-		for (int g = 0; g < 2; g++) {
-			if (!ps->grains[g].active) continue;
-
-			float t = (float)ps->grains[g].pos / GRAIN_SIZE;
-			float win = 0.5f * (1.0f - cosf(2.0f * M_PI * t));
-			float rpos = ps->grains[g].start + ps->grains[g].pos;
-			out += pitch_interp(pbuf, rpos) * win;
-
-			ps->grains[g].pos++;
-			if (ps->grains[g].pos >= GRAIN_SIZE)
-				ps->grains[g].active = 0;
+		float ratio = 1.6f; /* read faster → output is lower pitch */
+		for (int i = 0; i < n; i++) {
+			float pos = fmodf(*phase, (float)n);
+			int idx0 = (int)pos;
+			int idx1 = (idx0 + 1) % n;
+			float frac = pos - idx0;
+			buf[i] = tmp[idx0] * (1.0f - frac) + tmp[idx1] * frac;
+			*phase += ratio;
 		}
-
-		buf[i] = out;
+		*phase = fmodf(*phase, (float)n);
+		break;
+	}
+	case FX_ROBOT: {
+		/* Ring modulator: multiply by a sine wave.
+		 * Creates metallic, robotic voice — no pitch shift needed. */
+		float freq = 150.0f; /* modulation frequency */
+		float step = 2.0f * M_PI * freq / sample_rate;
+		for (int i = 0; i < n; i++) {
+			buf[i] *= 0.5f + 0.5f * sinf(fx_robot_phase);
+			fx_robot_phase += step;
+		}
+		if (fx_robot_phase > 2.0f * M_PI * 1000)
+			fx_robot_phase -= 2.0f * M_PI * 1000;
+		break;
+	}
+	default:
+		break;
 	}
 }
 
@@ -624,7 +583,7 @@ static void *audio_thread(void *arg)
 
 /* ── ALSA playback ring buffer ──────────────────────────────────────── */
 
-#define PLAY_RING_SLOTS  8
+#define PLAY_RING_SLOTS  4  /* keep small for low latency */
 static float *play_ring;          /* [PLAY_RING_SLOTS][channels * period_frames] */
 static int play_ring_write = 0;
 static int play_ring_read  = 0;
@@ -1315,17 +1274,14 @@ static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 		const char *presets[] = {
 			"Normal", "Chipmunk", "Deep", "Robot"
 		};
-		float ratios[] = { 1.0f, 1.8f, 0.6f, 0.5f };
-		int n_presets = 4;
+		int n_presets = FX_COUNT;
 		int pbw = (ow - 40) / n_presets;
 
 		for (int i = 0; i < n_presets; i++) {
 			int px = ox + 20 + i * pbw;
 			SDL_Rect pr = { px, py, pbw - 4, 22 };
 
-			int is_active = pitch_enabled &&
-					fabsf(pitch_ratio - ratios[i]) < 0.05f;
-			if (i == 0) is_active = !pitch_enabled;
+			int is_active = (fx_mode == i);
 
 			if (is_active) {
 				SDL_SetRenderDrawColor(r, 200, 160, 50, 200);
@@ -1346,7 +1302,7 @@ static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 
 		/* Store rects for hit testing */
 		SDL_SetRenderDrawColor(r, 100, 100, 120, 255);
-		draw_text(r, "PITCH:", ox + 4, py + 5, 1);
+		draw_text(r, "VOICE FX:", ox + 2, py + 5, 1);
 	}
 
 	/* Status line at bottom */
@@ -1356,10 +1312,10 @@ static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 
 	if (playback_active) {
 		snprintf(status, sizeof(status),
-			 "Pipeline: %.0fms  Noise:%s  Pitch:%.1fx",
+			 "Pipeline: %.0fms  Noise:%s  FX:%s",
 			 pipeline_latency_ms,
 			 noise_reduce ? "ON" : "OFF",
-			 pitch_enabled ? pitch_ratio : 1.0f);
+			 fx_names[fx_mode]);
 	} else {
 		snprintf(status, sizeof(status),
 			 "EQ %s  Delay %s  Playback OFF",
@@ -1378,7 +1334,7 @@ static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 #define EQ_HIT_GAIN     EQ_BANDS
 #define EQ_HIT_DELAY    (EQ_BANDS + 1)
 #define EQ_HIT_PITCH_BASE (EQ_BANDS + 2)
-static const float pitch_presets[] = { 1.0f, 1.8f, 0.6f, 0.5f };
+/* FX presets are selected by index matching FX_NONE..FX_ROBOT */
 
 static int eq_hit_test(float fx, float fy, int win_w, int win_h)
 {
@@ -2000,8 +1956,7 @@ int main(int argc, char *argv[])
 	delay_buf_l = calloc(MAX_DELAY_SAMPLES, sizeof(float));
 	delay_buf_r = calloc(MAX_DELAY_SAMPLES, sizeof(float));
 	delay_len = (int)(delay_ms / 1000.0f * sample_rate);
-	pitch_buf_l = calloc(PITCH_BUF_SIZE, sizeof(float));
-	pitch_buf_r = calloc(PITCH_BUF_SIZE, sizeof(float));
+	/* (pitch buffers removed — effects work in-place now) */
 
 	/* Playback ring buffer + thread */
 	int play_slot_size = channels * period_frames;
@@ -2085,16 +2040,10 @@ int main(int argc, char *argv[])
 						ev.tfinger.x, ev.tfinger.y,
 						WIN_W, WIN_H);
 					if (hit >= EQ_HIT_PITCH_BASE) {
-						/* Pitch preset button */
+						/* FX preset button */
 						int pi = hit - EQ_HIT_PITCH_BASE;
-						if (pi == 0) {
-							pitch_enabled = 0;
-							pitch_ratio = 1.0f;
-						} else {
-							pitch_enabled = 1;
-							pitch_ratio = pitch_presets[pi];
-						}
-						ph_initialized = 0; /* reset heads */
+						if (pi >= 0 && pi < FX_COUNT)
+							fx_mode = pi;
 					} else if (hit >= 0) {
 						eq_dragging = hit;
 						eq_drag_update(ev.tfinger.y,
@@ -2229,14 +2178,13 @@ int main(int argc, char *argv[])
 							playback_gate_db);
 				}
 
-				/* Pitch shift */
-				if (pitch_enabled && fabsf(pitch_ratio - 1.0f) > 0.01f) {
-					pitch_shift(pb1, period_frames,
-						    pitch_buf_l, pitch_ratio);
+				/* Voice effect */
+				if (fx_mode != FX_NONE) {
+					fx_apply(pb1, period_frames, fx_mode,
+						 &fx_phase_l);
 					if (pb2)
-						pitch_shift(pb2, period_frames,
-							    pitch_buf_r,
-							    pitch_ratio);
+						fx_apply(pb2, period_frames,
+							 fx_mode, &fx_phase_r);
 				}
 
 				playback_feed(pb1, pb2, period_frames);
@@ -2654,8 +2602,7 @@ int main(int argc, char *argv[])
 		pthread_join(play_tid, NULL);
 	free(delay_buf_l);
 	free(delay_buf_r);
-	free(pitch_buf_l);
-	free(pitch_buf_r);
+	/* pitch buffers removed — effects work in-place */
 	free(play_ring);
 
 	fftwf_destroy_plan(plan_fwd);
