@@ -135,7 +135,7 @@ static const char *fx_names[FX_COUNT] = {
 
 /* Noise gate for playback */
 static float playback_gate_db = -45.0f;
-static int noise_reduce = 1; /* on by default */
+static int noise_reduce = 0; /* off by default — toggle with key/button */
 
 /* Pipeline latency */
 static float pipeline_latency_ms = 0;
@@ -2287,10 +2287,17 @@ int main(int argc, char *argv[])
 				float pb1[4096], pb2[4096];
 				int pn = period_frames < 4096 ?
 					 (int)period_frames : 4096;
-				memcpy(pb1, ch1_buf, pn * sizeof(float));
-				if (channels == 2)
-					memcpy(pb2, ch2_buf,
-					       pn * sizeof(float));
+
+				/* Undo display gain for playback — the mic
+				 * signal was amplified for visualization but
+				 * playback needs a natural level. Target ~0.5
+				 * peak for comfortable listening. */
+				float play_gain = 0.5f / (gain > 1 ? gain : 1);
+				for (int i = 0; i < pn; i++) {
+					pb1[i] = ch1_buf[i] * play_gain;
+					if (channels == 2)
+						pb2[i] = ch2_buf[i] * play_gain;
+				}
 
 				if (noise_reduce) {
 					noise_reduce_process(pb1, pn,
@@ -2306,10 +2313,16 @@ int main(int argc, char *argv[])
 						fx_apply(pb2, pn, fx_mode,
 							 &fx_phase_r);
 				}
+
+				/* Hard clip only if needed (shouldn't happen
+				 * at normal levels with gain compensation) */
 				for (int i = 0; i < pn; i++) {
-					pb1[i] = tanhf(pb1[i]);
-					if (channels == 2)
-						pb2[i] = tanhf(pb2[i]);
+					if (pb1[i] > 1.0f) pb1[i] = 1.0f;
+					if (pb1[i] < -1.0f) pb1[i] = -1.0f;
+					if (channels == 2) {
+						if (pb2[i] > 1.0f) pb2[i] = 1.0f;
+						if (pb2[i] < -1.0f) pb2[i] = -1.0f;
+					}
 				}
 
 				playback_feed(pb1,
