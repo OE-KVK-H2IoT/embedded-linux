@@ -854,7 +854,7 @@ static void draw_direction_indicator(SDL_Renderer *r, float angle_deg,
 
 /* ── On-screen touch buttons ────────────────────────────────────────── */
 
-#define BTN_COUNT 5
+#define BTN_COUNT 6
 #define BTN_H     36
 
 typedef struct {
@@ -870,7 +870,10 @@ static touch_btn_t buttons[BTN_COUNT] = {
 	{ "GATE",   1, 60, 255, 120,  0.0f, 0.0f },
 	{ "EQ",     0, 255, 200, 50,  0.0f, 0.0f },
 	{ "PLAY",   0, 50, 255, 50,   0.0f, 0.0f },
+	{ "TDOA",   0, 255, 130, 255, 0.0f, 0.0f },
 };
+
+static int tdoa_overlay = 0;
 
 static void layout_buttons(int win_w, int win_h)
 {
@@ -1158,6 +1161,240 @@ static void eq_drag_update(float fy, int win_h)
 	}
 }
 
+/* ── TDOA visualization overlay ─────────────────────────────────────── */
+
+static void draw_tdoa_overlay(SDL_Renderer *r, int win_w, int win_h,
+			      const float *ch1, const float *ch2,
+			      const float *corr_buf, int fft_n,
+			      int max_lag_samples, float delay_samp,
+			      float angle, float conf)
+{
+	int margin = 30;
+	int ox = margin, oy = margin;
+	int ow = win_w - 2 * margin;
+	int oh = win_h - 2 * margin;
+
+	/* Semi-transparent background */
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(r, 10, 10, 15, 220);
+	SDL_Rect bg = { ox, oy, ow, oh };
+	SDL_RenderFillRect(r, &bg);
+	SDL_SetRenderDrawColor(r, 80, 80, 100, 255);
+	SDL_RenderDrawRect(r, &bg);
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+	/* Title */
+	SDL_SetRenderDrawColor(r, 200, 200, 220, 255);
+	draw_text(r, "TDOA VISUALIZATION", ox + 10, oy + 8, 2);
+	SDL_SetRenderDrawColor(r, 120, 120, 140, 255);
+	draw_text(r, "tap TDOA to close", ox + ow - 200, oy + 8, 2);
+
+	if (!ch1 || !ch2 || !corr_buf) {
+		SDL_SetRenderDrawColor(r, 140, 140, 160, 255);
+		draw_text(r, "Stereo mode required (-c 2)",
+			  ox + ow / 2 - 100, oy + oh / 2, 2);
+		return;
+	}
+
+	int pad = 15;
+	int inner_w = ow - 2 * pad;
+
+	/* ── Top panel: overlaid channel waveforms ──────────────── */
+
+	int wave_oy = oy + 35;
+	int wave_h = (oh - 100) / 3;
+	int n = (int)period_frames;
+
+	/* Border + zero line */
+	SDL_SetRenderDrawColor(r, 50, 50, 60, 255);
+	SDL_Rect wb = { ox + pad, wave_oy, inner_w, wave_h };
+	SDL_RenderDrawRect(r, &wb);
+	int wmid = wave_oy + wave_h / 2;
+	SDL_SetRenderDrawColor(r, 35, 35, 45, 255);
+	SDL_RenderDrawLine(r, ox + pad, wmid, ox + pad + inner_w, wmid);
+
+	/* Channel 1 — cyan */
+	SDL_SetRenderDrawColor(r, 0, 200, 255, 255);
+	for (int i = 1; i < inner_w; i++) {
+		int s0 = (i - 1) * n / inner_w;
+		int s1 = i * n / inner_w;
+		if (s0 >= n) s0 = n - 1;
+		if (s1 >= n) s1 = n - 1;
+		int y0 = wmid - (int)(ch1[s0] * wave_h / 2);
+		int y1 = wmid - (int)(ch1[s1] * wave_h / 2);
+		if (y0 < wave_oy) y0 = wave_oy;
+		if (y0 > wave_oy + wave_h) y0 = wave_oy + wave_h;
+		if (y1 < wave_oy) y1 = wave_oy;
+		if (y1 > wave_oy + wave_h) y1 = wave_oy + wave_h;
+		SDL_RenderDrawLine(r, ox + pad + i - 1, y0,
+				   ox + pad + i, y1);
+	}
+
+	/* Channel 2 — orange */
+	SDL_SetRenderDrawColor(r, 255, 150, 0, 255);
+	for (int i = 1; i < inner_w; i++) {
+		int s0 = (i - 1) * n / inner_w;
+		int s1 = i * n / inner_w;
+		if (s0 >= n) s0 = n - 1;
+		if (s1 >= n) s1 = n - 1;
+		int y0 = wmid - (int)(ch2[s0] * wave_h / 2);
+		int y1 = wmid - (int)(ch2[s1] * wave_h / 2);
+		if (y0 < wave_oy) y0 = wave_oy;
+		if (y0 > wave_oy + wave_h) y0 = wave_oy + wave_h;
+		if (y1 < wave_oy) y1 = wave_oy;
+		if (y1 > wave_oy + wave_h) y1 = wave_oy + wave_h;
+		SDL_RenderDrawLine(r, ox + pad + i - 1, y0,
+				   ox + pad + i, y1);
+	}
+
+	/* Label */
+	SDL_SetRenderDrawColor(r, 0, 200, 255, 255);
+	draw_text(r, "CH1", ox + pad + 3, wave_oy + 3, 1);
+	SDL_SetRenderDrawColor(r, 255, 150, 0, 255);
+	draw_text(r, "CH2", ox + pad + 30, wave_oy + 3, 1);
+
+	/* Lag annotation in samples/microseconds */
+	{
+		char lagstr[48];
+		float lag_us = delay_samp / sample_rate * 1e6f;
+		snprintf(lagstr, sizeof(lagstr),
+			 "Delay: %.1f samples  %.1f us",
+			 delay_samp, lag_us);
+		SDL_SetRenderDrawColor(r, 180, 180, 200, 255);
+		draw_text(r, lagstr, ox + pad + inner_w - 280,
+			  wave_oy + 3, 1);
+	}
+
+	/* ── Middle panel: GCC-PHAT correlation ────────────────── */
+
+	int corr_oy = wave_oy + wave_h + 15;
+	int corr_h = wave_h;
+
+	SDL_SetRenderDrawColor(r, 50, 50, 60, 255);
+	SDL_Rect cb = { ox + pad, corr_oy, inner_w, corr_h };
+	SDL_RenderDrawRect(r, &cb);
+	int cmid = corr_oy + corr_h / 2;
+
+	/* Zero line */
+	SDL_SetRenderDrawColor(r, 35, 35, 45, 255);
+	SDL_RenderDrawLine(r, ox + pad, cmid, ox + pad + inner_w, cmid);
+
+	/* Zero-lag marker (center) */
+	int center_x = ox + pad + inner_w / 2;
+	SDL_SetRenderDrawColor(r, 50, 50, 70, 255);
+	SDL_RenderDrawLine(r, center_x, corr_oy, center_x, corr_oy + corr_h);
+
+	/* Plot correlation: show -max_lag to +max_lag region
+	 * corr[0..max_lag-1] = positive lags
+	 * corr[fft_n-max_lag..fft_n-1] = negative lags */
+	int display_lags = max_lag_samples * 2;
+
+	/* Find max for scaling */
+	float corr_max = 0;
+	for (int i = 0; i < max_lag_samples; i++) {
+		float v = fabsf(corr_buf[i]);
+		if (v > corr_max) corr_max = v;
+	}
+	for (int i = fft_n - max_lag_samples; i < fft_n; i++) {
+		float v = fabsf(corr_buf[i]);
+		if (v > corr_max) corr_max = v;
+	}
+	if (corr_max < 1e-10f) corr_max = 1.0f;
+
+	/* Draw the correlation curve — green */
+	SDL_SetRenderDrawColor(r, 50, 255, 100, 255);
+	int prev_cy = cmid;
+	for (int i = 0; i < inner_w; i++) {
+		/* Map pixel to lag index (-max_lag .. +max_lag) */
+		float lag_f = (float)i / inner_w * display_lags -
+			      max_lag_samples;
+		int lag_i = (int)roundf(lag_f);
+		int idx;
+		if (lag_i >= 0)
+			idx = lag_i < fft_n ? lag_i : fft_n - 1;
+		else
+			idx = fft_n + lag_i;
+		if (idx < 0) idx = 0;
+		if (idx >= fft_n) idx = fft_n - 1;
+
+		float val = corr_buf[idx] / corr_max;
+		int cy = cmid - (int)(val * corr_h / 2 * 0.9f);
+		if (cy < corr_oy) cy = corr_oy;
+		if (cy > corr_oy + corr_h) cy = corr_oy + corr_h;
+
+		if (i > 0)
+			SDL_RenderDrawLine(r, ox + pad + i - 1, prev_cy,
+					   ox + pad + i, cy);
+		prev_cy = cy;
+	}
+
+	/* Peak marker — yellow vertical line at detected delay */
+	{
+		float peak_px_f = (delay_samp + max_lag_samples) /
+				  display_lags * inner_w;
+		int peak_px = ox + pad + (int)peak_px_f;
+		if (peak_px > ox + pad && peak_px < ox + pad + inner_w) {
+			SDL_SetRenderDrawColor(r, 255, 255, 0, 255);
+			SDL_RenderDrawLine(r, peak_px, corr_oy + 2,
+					   peak_px, corr_oy + corr_h - 2);
+			/* Arrow head at top */
+			SDL_RenderDrawLine(r, peak_px - 4, corr_oy + 8,
+					   peak_px, corr_oy + 2);
+			SDL_RenderDrawLine(r, peak_px + 4, corr_oy + 8,
+					   peak_px, corr_oy + 2);
+
+			/* Label above: delay value */
+			char plbl[24];
+			snprintf(plbl, sizeof(plbl), "%.1f", delay_samp);
+			draw_text(r, plbl, peak_px + 6, corr_oy + 3, 1);
+		}
+	}
+
+	/* Lag axis labels */
+	SDL_SetRenderDrawColor(r, 120, 120, 140, 255);
+	{
+		char ll[16];
+		snprintf(ll, sizeof(ll), "-%d", max_lag_samples);
+		draw_text(r, ll, ox + pad + 2, corr_oy + corr_h - 10, 1);
+		snprintf(ll, sizeof(ll), "+%d", max_lag_samples);
+		draw_text(r, ll, ox + pad + inner_w - 24,
+			  corr_oy + corr_h - 10, 1);
+		draw_text(r, "0", center_x + 2,
+			  corr_oy + corr_h - 10, 1);
+		draw_text(r, "GCC-PHAT Cross-Correlation",
+			  ox + pad + 3, corr_oy + 3, 1);
+		draw_text(r, "lag (samples)", center_x - 36,
+			  corr_oy + corr_h - 10, 1);
+	}
+
+	/* ── Bottom panel: info ────────────────────────────────── */
+
+	int info_y = corr_oy + corr_h + 20;
+	SDL_SetRenderDrawColor(r, 160, 170, 190, 255);
+
+	char info1[80], info2[80], info3[80];
+	float tau_us = delay_samp / sample_rate * 1e6f;
+	float distance_cm = fabsf(delay_samp) / sample_rate *
+			    SPEED_OF_SOUND * 100.0f;
+
+	snprintf(info1, sizeof(info1),
+		 "Delay: %+.2f samples  %+.1f us  "
+		 "Path diff: %.2f cm",
+		 delay_samp, tau_us, distance_cm);
+	snprintf(info2, sizeof(info2),
+		 "Angle: %.1f deg  Confidence: %.2f  "
+		 "Mic spacing: %.1f cm",
+		 angle, conf, mic_distance * 100);
+	snprintf(info3, sizeof(info3),
+		 "Max lag: %d samples (%.1f cm / %.0f m/s / %u Hz)",
+		 max_lag_samples,
+		 mic_distance * 100, SPEED_OF_SOUND, sample_rate);
+
+	draw_text(r, info1, ox + pad, info_y, 2);
+	draw_text(r, info2, ox + pad, info_y + 20, 2);
+	draw_text(r, info3, ox + pad, info_y + 40, 1);
+}
+
 /* ── 5x7 rounded font ──────────────────────────────────────────────── */
 
 #define FONT_W 5
@@ -1318,6 +1555,7 @@ int main(int argc, char *argv[])
 	buttons[2].active = gate_enabled;  /* GATE — on by default */
 	buttons[3].active = 0;             /* EQ overlay — off */
 	buttons[4].active = 0;             /* PLAY — off */
+	buttons[5].active = 0;             /* TDOA viz — off */
 
 	/* Allocate ring buffer */
 	int slot_size = channels * period_frames;
@@ -1513,6 +1751,10 @@ int main(int argc, char *argv[])
 						buttons[4].active = playback_active;
 					}
 					break;
+				case SDLK_t:
+					tdoa_overlay = !tdoa_overlay;
+					buttons[5].active = tdoa_overlay;
+					break;
 				}
 			}
 			/* Touch: track start position for tap vs swipe */
@@ -1567,6 +1809,10 @@ int main(int argc, char *argv[])
 							buttons[4].active =
 								playback_active;
 						}
+					} else if (btn == 5) {
+						tdoa_overlay = !tdoa_overlay;
+						buttons[5].active =
+							tdoa_overlay;
 					}
 				}
 				swipe_active = 0;
@@ -2008,6 +2254,14 @@ int main(int argc, char *argv[])
 		/* EQ overlay (drawn on top of everything) */
 		if (eq_overlay)
 			draw_eq_overlay(ren, WIN_W, WIN_H);
+
+		/* TDOA overlay */
+		if (tdoa_overlay && stereo)
+			draw_tdoa_overlay(ren, WIN_W, WIN_H,
+					  ch1_buf, ch2_buf,
+					  corr, fft_size, max_lag,
+					  delay_samples, angle_deg,
+					  confidence);
 
 		SDL_RenderPresent(ren);
 	}
