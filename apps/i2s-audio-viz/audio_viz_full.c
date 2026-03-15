@@ -347,77 +347,88 @@ static void delay_process(float *buf, int n, float *dbuf)
 /* ── Voice effects (applied to playback copy only) ─────────────────── */
 
 /*
- * Chipmunk: read through input FASTER → output has higher pitch.
- *   ratio > 1 means we consume more input per output sample.
- * Deep: read through input SLOWER → output has lower pitch.
- *   ratio < 1 means we consume less input per output sample.
- *
- * Both use a crossfade at the wrap point (last 64 samples blend
- * with the start) to eliminate the periodic pop/click.
+ * Pitch effects use a circular history buffer that accumulates
+ * audio across blocks.  The read pointer advances at a different
+ * rate than the write pointer.  This avoids the distortion from
+ * looping within a single 21ms block.
  */
 
-static float fx_phase_l = 0, fx_phase_r = 0;
-static float fx_robot_phase = 0;  /* ring modulator oscillator */
+#define FX_HIST_SIZE (48000)  /* 1 second circular buffer per channel */
+static float fx_hist_l[FX_HIST_SIZE];
+static float fx_hist_r[FX_HIST_SIZE];
+static int fx_wr = 0;
+static float fx_rd_l = 0, fx_rd_r = 0;
+static int fx_inited = 0;
+static float fx_robot_phase = 0;
 
-#define XFADE_LEN 64
-
-static void fx_resample(float *buf, int n, float ratio, float *phase)
+static float fx_interp(const float *h, float pos)
 {
-	float tmp[4096];
-	if (n > 4096) n = 4096;
-	memcpy(tmp, buf, n * sizeof(float));
-
-	for (int i = 0; i < n; i++) {
-		float pos = fmodf(*phase, (float)n);
-		int idx0 = (int)pos;
-		int idx1 = (idx0 + 1) % n;
-		float frac = pos - idx0;
-		float sample = tmp[idx0] * (1.0f - frac) + tmp[idx1] * frac;
-
-		/* Crossfade near the wrap point to avoid click */
-		float dist_to_end = (float)n - pos;
-		if (dist_to_end < XFADE_LEN) {
-			float t = dist_to_end / XFADE_LEN; /* 1→0 */
-			/* Blend with sample from the beginning */
-			float wrap_pos = fmodf(pos - (float)n, (float)n);
-			if (wrap_pos < 0) wrap_pos += n;
-			int w0 = (int)wrap_pos;
-			int w1 = (w0 + 1) % n;
-			float wfrac = wrap_pos - w0;
-			float wrap_sample = tmp[w0] * (1.0f - wfrac) +
-					    tmp[w1] * wfrac;
-			sample = sample * t + wrap_sample * (1.0f - t);
-		}
-
-		buf[i] = sample;
-		*phase += ratio;
-	}
-	/* Keep phase bounded to prevent float precision loss */
-	*phase = fmodf(*phase, (float)n);
+	int i0 = ((int)pos) % FX_HIST_SIZE;
+	if (i0 < 0) i0 += FX_HIST_SIZE;
+	int i1 = (i0 + 1) % FX_HIST_SIZE;
+	float f = pos - floorf(pos);
+	return h[i0] * (1.0f - f) + h[i1] * f;
 }
 
-static void fx_apply(float *buf, int n, int mode, float *phase)
+static void fx_pitch(float *buf, int n, float ratio,
+		     const float *hist, float *rd)
 {
+	for (int i = 0; i < n; i++) {
+		buf[i] = fx_interp(hist, *rd);
+		*rd += ratio;
+		while (*rd >= FX_HIST_SIZE) *rd -= FX_HIST_SIZE;
+		while (*rd < 0) *rd += FX_HIST_SIZE;
+	}
+
+	/* Keep read ~0.25s behind write to avoid collision */
+	float dist = fx_wr - *rd;
+	if (dist < 0) dist += FX_HIST_SIZE;
+	if (dist < 2000 || dist > FX_HIST_SIZE - 2000)
+		*rd = (float)((fx_wr - FX_HIST_SIZE / 4 +
+			       FX_HIST_SIZE) % FX_HIST_SIZE);
+}
+
+static void fx_apply(float *pb1, float *pb2, int n, int nch, int mode)
+{
+	/* Append to history */
+	for (int i = 0; i < n; i++) {
+		fx_hist_l[fx_wr] = pb1[i];
+		if (nch == 2 && pb2)
+			fx_hist_r[fx_wr] = pb2[i];
+		fx_wr = (fx_wr + 1) % FX_HIST_SIZE;
+	}
+
+	/* Init read positions on first call */
+	if (!fx_inited) {
+		fx_rd_l = (float)((fx_wr - FX_HIST_SIZE / 4 +
+				    FX_HIST_SIZE) % FX_HIST_SIZE);
+		fx_rd_r = fx_rd_l;
+		fx_inited = 1;
+	}
+
 	switch (mode) {
 	case FX_CHIPMUNK:
-		fx_resample(buf, n, 1.6f, phase); /* faster read → higher */
+		fx_pitch(pb1, n, 1.5f, fx_hist_l, &fx_rd_l);
+		if (nch == 2 && pb2)
+			fx_pitch(pb2, n, 1.5f, fx_hist_r, &fx_rd_r);
 		break;
 	case FX_DEEP:
-		fx_resample(buf, n, 0.6f, phase); /* slower read → lower */
+		fx_pitch(pb1, n, 0.7f, fx_hist_l, &fx_rd_l);
+		if (nch == 2 && pb2)
+			fx_pitch(pb2, n, 0.7f, fx_hist_r, &fx_rd_r);
 		break;
 	case FX_ROBOT: {
-		/* Bitcrusher + ring mod = classic "Dalek" robot voice.
-		 * 1. Reduce sample rate (sample-and-hold every N samples)
-		 * 2. Ring modulate at low frequency for metallic tone */
-		int decimate = 6; /* hold every 6th sample → ~8 kHz staircase */
-		float mod_freq = 80.0f;
-		float step = 2.0f * M_PI * mod_freq / sample_rate;
-		float held = 0;
+		int decimate = 6;
+		float step = 2.0f * M_PI * 80.0f / sample_rate;
+		float held_l = 0, held_r = 0;
 		for (int i = 0; i < n; i++) {
-			if (i % decimate == 0)
-				held = buf[i];
-			/* Ring mod: true multiply (no offset) → metallic */
-			buf[i] = held * sinf(fx_robot_phase);
+			if (i % decimate == 0) {
+				held_l = pb1[i];
+				if (nch == 2 && pb2) held_r = pb2[i];
+			}
+			float mod = sinf(fx_robot_phase);
+			pb1[i] = held_l * mod;
+			if (nch == 2 && pb2) pb2[i] = held_r * mod;
 			fx_robot_phase += step;
 		}
 		if (fx_robot_phase > 2.0f * M_PI * 1000)
@@ -2306,13 +2317,9 @@ int main(int argc, char *argv[])
 						noise_reduce_process(pb2, pn,
 							playback_gate_db);
 				}
-				if (fx_mode != FX_NONE) {
-					fx_apply(pb1, pn, fx_mode,
-						 &fx_phase_l);
-					if (channels == 2)
-						fx_apply(pb2, pn, fx_mode,
-							 &fx_phase_r);
-				}
+				if (fx_mode != FX_NONE)
+					fx_apply(pb1, channels == 2 ? pb2 : NULL,
+						 pn, channels, fx_mode);
 
 				/* Hard clip only if needed (shouldn't happen
 				 * at normal levels with gain compensation) */

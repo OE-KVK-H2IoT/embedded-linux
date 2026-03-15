@@ -5,7 +5,7 @@ Conflicts=level-sdl2.service sdl2-dashboard.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/pi/embedded-linux/apps/level_display.py
+ExecStart=/usr/bin/python3 /home/pi/embedded-linux/apps/level-display/level_display.py
 Restart=on-failure
 RestartSec=3
 User=root

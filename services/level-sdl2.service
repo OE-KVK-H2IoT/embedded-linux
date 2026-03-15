@@ -5,7 +5,7 @@ Conflicts=sdl2-dashboard.service level-display-py.service
 
 [Service]
 Type=simple
-ExecStart=/home/pi/embedded-linux/apps/level_sdl2
+ExecStart=/home/pi/embedded-linux/apps/level-display/level_sdl2
 Environment=SDL_VIDEODRIVER=kmsdrm
 Restart=on-failure
 RestartSec=3

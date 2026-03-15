@@ -11,8 +11,14 @@ build/
 *.bin
 
 # Compiled app binaries (built via make/cmake)
-apps/level_sdl2
-apps/sdl2_dashboard
-apps/pong_fb
-apps/atomic_sensor
-apps/iio_capture
+apps/i2s-audio-viz/audio_viz
+apps/i2s-audio-viz/audio_viz_full
+apps/level-display/level_sdl2
+apps/sdl2-dashboard/sdl2_dashboard
+apps/pong-fb/pong_fb
+apps/iio-buffered-capture/iio_capture
+apps/processes-and-ipc/atomic_sensor
+
+# Python artifacts
+scripts/acoustic-keystroke/*.pkl
+scripts/acoustic-keystroke/keystroke_data/
