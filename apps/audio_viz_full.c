@@ -337,40 +337,90 @@ static void delay_process(float *buf, int n, float *dbuf)
 	}
 }
 
-/* ── Pitch shift (simple linear-interpolation resampling) ───────────── */
+/* ── Pitch shift (dual-head overlap-add) ────────────────────────────── */
+/*
+ * Two read heads (A and B) advance through the input buffer at
+ * pitch_ratio speed, offset by half a grain.  Each head reads a
+ * grain of GRAIN_SIZE samples with a Hann window.  When a head
+ * reaches the end of its grain, it repositions to fresh input
+ * and restarts.  The crossfade between heads eliminates clicks.
+ */
+
+#define GRAIN_SIZE 2048  /* ~42 ms at 48 kHz — good balance of quality vs latency */
+
+typedef struct {
+	float phase;       /* fractional read position in pitch buffer */
+	int grain_pos;     /* samples read in current grain (0..GRAIN_SIZE-1) */
+	int active;
+} pitch_head_t;
 
 static int pitch_write_pos = 0;
+static pitch_head_t ph_heads[2] = {{0, 0, 1}, {0, 0, 1}};
+static int ph_initialized = 0;
+
+static float pitch_interp(const float *pbuf, float phase)
+{
+	int idx0 = (int)phase;
+	if (idx0 < 0) idx0 += PITCH_BUF_SIZE;
+	idx0 = idx0 % PITCH_BUF_SIZE;
+	int idx1 = (idx0 + 1) % PITCH_BUF_SIZE;
+	float frac = phase - floorf(phase);
+	return pbuf[idx0] * (1.0f - frac) + pbuf[idx1] * frac;
+}
 
 static void pitch_shift(float *buf, int n, float *pbuf, float ratio)
 {
-	/* Write input into pitch buffer */
+	/* Write input into circular pitch buffer */
 	for (int i = 0; i < n; i++) {
 		pbuf[pitch_write_pos] = buf[i];
 		pitch_write_pos = (pitch_write_pos + 1) % PITCH_BUF_SIZE;
 	}
 
-	/* Read back at different rate: ratio > 1 = higher pitch (chipmunk),
-	 * ratio < 1 = lower pitch (Darth Vader).
-	 * Uses linear interpolation for smooth output. */
-	static float read_phase = 0;
-	for (int i = 0; i < n; i++) {
-		int idx0 = (int)read_phase % PITCH_BUF_SIZE;
-		int idx1 = (idx0 + 1) % PITCH_BUF_SIZE;
-		float frac = read_phase - (int)read_phase;
-		buf[i] = pbuf[idx0] * (1.0f - frac) + pbuf[idx1] * frac;
-		read_phase += ratio;
-		/* Keep read_phase from drifting too far from write pos */
-		float dist = pitch_write_pos - read_phase;
-		if (dist < 0) dist += PITCH_BUF_SIZE;
-		if (dist > PITCH_BUF_SIZE / 2 || dist < n * 2) {
-			/* Re-sync: snap read to a safe distance behind write */
-			read_phase = (float)((pitch_write_pos - n * 4 +
-					      PITCH_BUF_SIZE) % PITCH_BUF_SIZE);
-		}
+	/* Initialize heads on first call */
+	if (!ph_initialized) {
+		ph_heads[0].phase = (float)((pitch_write_pos - GRAIN_SIZE * 2 +
+					     PITCH_BUF_SIZE) % PITCH_BUF_SIZE);
+		ph_heads[0].grain_pos = 0;
+		ph_heads[1].phase = ph_heads[0].phase + GRAIN_SIZE / 2.0f;
+		ph_heads[1].grain_pos = GRAIN_SIZE / 2;
+		ph_initialized = 1;
 	}
-	/* Wrap phase */
-	while (read_phase >= PITCH_BUF_SIZE) read_phase -= PITCH_BUF_SIZE;
-	while (read_phase < 0) read_phase += PITCH_BUF_SIZE;
+
+	for (int i = 0; i < n; i++) {
+		float out = 0;
+
+		for (int h = 0; h < 2; h++) {
+			pitch_head_t *hd = &ph_heads[h];
+
+			/* Hann window for this position in the grain */
+			float t = (float)hd->grain_pos / GRAIN_SIZE;
+			float win = 0.5f * (1.0f - cosf(2.0f * M_PI * t));
+
+			/* Read with interpolation */
+			out += pitch_interp(pbuf, hd->phase) * win;
+
+			/* Advance read position */
+			hd->phase += ratio;
+			while (hd->phase >= PITCH_BUF_SIZE)
+				hd->phase -= PITCH_BUF_SIZE;
+			while (hd->phase < 0)
+				hd->phase += PITCH_BUF_SIZE;
+
+			hd->grain_pos++;
+
+			/* Reset grain: reposition to fresh input */
+			if (hd->grain_pos >= GRAIN_SIZE) {
+				hd->grain_pos = 0;
+				/* Place read head behind write pos */
+				hd->phase = (float)((pitch_write_pos -
+						     GRAIN_SIZE * 2 +
+						     PITCH_BUF_SIZE) %
+						    PITCH_BUF_SIZE);
+			}
+		}
+
+		buf[i] = out;
+	}
 }
 
 /* ── Noise reduction (simple gate + smoothing) ─────────────────────── */
@@ -2011,6 +2061,7 @@ int main(int argc, char *argv[])
 							pitch_enabled = 1;
 							pitch_ratio = pitch_presets[pi];
 						}
+						ph_initialized = 0; /* reset heads */
 					} else if (hit >= 0) {
 						eq_dragging = hit;
 						eq_drag_update(ev.tfinger.y,
