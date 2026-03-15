@@ -48,7 +48,7 @@
 
 #define SPEED_OF_SOUND    343.0f
 #define DEFAULT_MIC_DIST  0.06f
-#define DEFAULT_GAIN      4.0f
+#define DEFAULT_GAIN      4.0f      /* display gain (I2S mics are quiet) */
 #define DEFAULT_WAVE_MS   50
 #define MAX_WAVE_SAMPLES  (48000*2)
 
@@ -70,7 +70,7 @@ static float gate_threshold_db = -40.0f;
 static int gate_enabled = 1;
 
 /* Band-pass filter */
-static float lp_cutoff = 5000; /* default: 5 kHz low-pass (toggled off initially) */
+static float lp_cutoff = 3000; /* default: 3 kHz low-pass (toggled off initially) */
 static float hp_cutoff = 115;  /* default: mains hum rejection */
 
 /* ALSA playback */
@@ -114,10 +114,10 @@ static float *delay_buf_l = NULL;
 static float *delay_buf_r = NULL;
 static int delay_len = 0;         /* in samples */
 static int delay_pos = 0;
-static float delay_feedback = 0.3f;
-static float delay_mix = 0.4f;
+static float delay_feedback = 0.2f;
+static float delay_mix = 0.3f;
 static int delay_enabled = 0;
-static float delay_ms = 200.0f;   /* default 200ms */
+static float delay_ms = 0.0f;     /* default: off (drag slider to enable) */
 
 /* Voice effects for playback */
 #define FX_NONE      0
@@ -403,12 +403,18 @@ static void fx_apply(float *buf, int n, int mode, float *phase)
 		fx_resample(buf, n, 0.6f, phase); /* slower read → lower */
 		break;
 	case FX_ROBOT: {
-		/* Ring modulator: multiply by a sine wave.
-		 * Creates metallic, robotic voice — no pitch shift needed. */
-		float freq = 150.0f; /* modulation frequency */
-		float step = 2.0f * M_PI * freq / sample_rate;
+		/* Bitcrusher + ring mod = classic "Dalek" robot voice.
+		 * 1. Reduce sample rate (sample-and-hold every N samples)
+		 * 2. Ring modulate at low frequency for metallic tone */
+		int decimate = 6; /* hold every 6th sample → ~8 kHz staircase */
+		float mod_freq = 80.0f;
+		float step = 2.0f * M_PI * mod_freq / sample_rate;
+		float held = 0;
 		for (int i = 0; i < n; i++) {
-			buf[i] *= 0.5f + 0.5f * sinf(fx_robot_phase);
+			if (i % decimate == 0)
+				held = buf[i];
+			/* Ring mod: true multiply (no offset) → metallic */
+			buf[i] = held * sinf(fx_robot_phase);
 			fx_robot_phase += step;
 		}
 		if (fx_robot_phase > 2.0f * M_PI * 1000)
@@ -2190,6 +2196,12 @@ int main(int argc, char *argv[])
 					if (pb2)
 						fx_apply(pb2, period_frames,
 							 fx_mode, &fx_phase_r);
+				}
+
+				/* Soft clip to prevent distortion from high gain */
+				for (int i = 0; i < (int)period_frames; i++) {
+					pb1[i] = tanhf(pb1[i]);
+					if (pb2) pb2[i] = tanhf(pb2[i]);
 				}
 
 				playback_feed(pb1, pb2, period_frames);
