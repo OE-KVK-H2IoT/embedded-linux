@@ -492,7 +492,7 @@ static void noise_reduce_process(float *buf, int n, float gate_db)
 		/* Update noise estimate during silence (within 6 dB of floor) */
 		float sig_db = 20.0f * log10f(rms + 1e-10f);
 		float flr_db = 20.0f * log10f(nr_floor_rms + 1e-10f);
-		int is_silence = (sig_db - flr_db) < 6.0f;
+		int is_silence = (sig_db - flr_db) < 3.0f;
 
 		if (is_silence) {
 			for (int i = 0; i < NR_HALF; i++) {
@@ -504,8 +504,8 @@ static void noise_reduce_process(float *buf, int n, float gate_db)
 		}
 
 		/* Spectral subtraction: reduce magnitude, keep phase */
-		float oversubtract = 2.0f; /* subtract 2x noise for cleaner result */
-		float floor_factor = 0.02f; /* don't go below -34 dB (avoids musical noise) */
+		float oversubtract = 1.0f; /* 1x noise — gentle, preserves voice */
+		float floor_factor = 0.1f; /* spectral floor at -20 dB */
 		for (int i = 0; i < NR_HALF; i++) {
 			float re = nr_freq[i][0];
 			float im = nr_freq[i][1];
@@ -531,19 +531,6 @@ static void noise_reduce_process(float *buf, int n, float gate_db)
 		}
 	}
 
-	/* Soft expander gate on residual — kills "musical noise" artifacts */
-	float rms = 0;
-	for (int i = 0; i < n; i++) rms += buf[i] * buf[i];
-	rms = sqrtf(rms / n);
-	float db = 20.0f * log10f(rms + 1e-10f);
-	float fdb = 20.0f * log10f(nr_floor_rms + 1e-10f);
-	float above = db - fdb;
-	if (above < 2.0f) {
-		for (int i = 0; i < n; i++) buf[i] = 0;
-	} else if (above < 10.0f) {
-		float g = (above - 2.0f) / 8.0f;
-		for (int i = 0; i < n; i++) buf[i] *= g;
-	}
 }
 
 /* ── Musical note detection ─────────────────────────────────────────── */
