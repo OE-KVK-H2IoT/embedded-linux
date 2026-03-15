@@ -70,8 +70,8 @@ static float gate_threshold_db = -40.0f;
 static int gate_enabled = 1;
 
 /* Band-pass filter */
-static float lp_cutoff = 0;   /* 0 = off */
-static float hp_cutoff = 115; /* default: mains hum rejection */
+static float lp_cutoff = 5000; /* default: 5 kHz low-pass (toggled off initially) */
+static float hp_cutoff = 115;  /* default: mains hum rejection */
 
 /* Ring buffer */
 static float *ring_buf;
@@ -424,9 +424,13 @@ static void draw_spectrum(SDL_Renderer *r, const float *mag_db, int bins,
 
 	float db_range = db_ceil - db_floor;
 	float nyquist = srate / 2.0f;
+	/* Cap display at 20 kHz — content above is inaudible */
+	float max_freq = nyquist < 20000.0f ? nyquist : 20000.0f;
+	int max_bin = (int)(max_freq / nyquist * (bins - 1));
+	if (max_bin >= bins) max_bin = bins - 1;
 
 	for (int i = 0; i < w; i++) {
-		int bin = i * (bins - 1) / w;
+		int bin = i * max_bin / w;
 		float norm = (mag_db[bin] - db_floor) / db_range;
 		if (norm < 0) norm = 0;
 		if (norm > 1) norm = 1;
@@ -450,8 +454,8 @@ static void draw_spectrum(SDL_Renderer *r, const float *mag_db, int bins,
 	float freq_ticks[] = {100, 500, 1000, 2000, 5000, 10000, 20000};
 	int n_ticks = sizeof(freq_ticks) / sizeof(freq_ticks[0]);
 	for (int t = 0; t < n_ticks; t++) {
-		if (freq_ticks[t] > nyquist) break;
-		int px = (int)(freq_ticks[t] / nyquist * w);
+		if (freq_ticks[t] > max_freq) break;
+		int px = (int)(freq_ticks[t] / max_freq * w);
 		if (px < 0 || px >= w) continue;
 
 		SDL_SetRenderDrawColor(r, 80, 80, 80, 255);
@@ -470,13 +474,18 @@ static void draw_spectrum(SDL_Renderer *r, const float *mag_db, int bins,
 
 static void draw_peak_hold(SDL_Renderer *r, const float *peak_db, int bins,
 			   int x0, int y0, int w, int h,
-			   float db_floor, float db_ceil)
+			   float db_floor, float db_ceil,
+			   unsigned int srate)
 {
+	float nyquist = srate / 2.0f;
+	float max_freq = nyquist < 20000.0f ? nyquist : 20000.0f;
+	int max_bin = (int)(max_freq / nyquist * (bins - 1));
+	if (max_bin >= bins) max_bin = bins - 1;
 	float db_range = db_ceil - db_floor;
 	SDL_SetRenderDrawColor(r, 255, 255, 255, 200);
 	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
 	for (int i = 0; i < w; i++) {
-		int bin = i * (bins - 1) / w;
+		int bin = i * max_bin / w;
 		float norm = (peak_db[bin] - db_floor) / db_range;
 		if (norm < 0) norm = 0;
 		if (norm > 1) norm = 1;
@@ -837,9 +846,9 @@ int main(int argc, char *argv[])
 	signal(SIGINT, handle_signal);
 	signal(SIGTERM, handle_signal);
 
-	/* Initialize button state from flags */
+	/* Initialize button state */
 	buttons[0].active = 0;             /* REC — off */
-	buttons[1].active = (lp_cutoff > 0); /* FILTER — on if -L given */
+	buttons[1].active = 0;             /* FILTER (low-pass) — off by default */
 	buttons[2].active = gate_enabled;  /* GATE — on by default */
 
 	/* Allocate ring buffer */
@@ -962,6 +971,7 @@ int main(int argc, char *argv[])
 	float latency_avg = 0;
 	float rms_db_avg = -60;
 	float dom_freq_avg = 0;
+	float note_freq_avg = 0;  /* even slower EMA for note display */
 
 	int max_lag = (int)(mic_distance / SPEED_OF_SOUND * sample_rate) + 10;
 	if (max_lag > fft_size / 2) max_lag = fft_size / 2;
@@ -981,6 +991,7 @@ int main(int argc, char *argv[])
 	/* ── Main loop ──────────────────────────────────────────────── */
 
 	int swipe_active = 0;
+	float touch_start_y = 0;
 	struct timespec capture_ts = {0, 0};
 
 	while (running) {
@@ -1010,35 +1021,41 @@ int main(int argc, char *argv[])
 					break;
 				}
 			}
-			/* Swipe up from bottom edge to exit */
+			/* Touch: track start position for tap vs swipe */
 			if (ev.type == SDL_FINGERDOWN) {
-				if (ev.tfinger.y > 0.9f)
+				touch_start_y = ev.tfinger.y;
+				if (ev.tfinger.y > 0.85f)
 					swipe_active = 1;
-				/* Check button bar */
-				int btn = hit_test_button(ev.tfinger.x,
-							  ev.tfinger.y,
-							  WIN_H);
-				if (btn == 0) {
-					/* REC toggle */
-					if (recording)
-						wav_stop();
-					else
-						wav_start(sample_rate, channels);
-					buttons[0].active = recording;
-				} else if (btn == 1) {
-					/* FILTER toggle */
-					buttons[1].active = !buttons[1].active;
-				} else if (btn == 2) {
-					/* GATE toggle */
-					buttons[2].active = !buttons[2].active;
-					gate_enabled = buttons[2].active;
-				}
 			}
-			if (ev.type == SDL_FINGERUP)
-				swipe_active = 0;
 			if (ev.type == SDL_FINGERMOTION && swipe_active &&
 			    ev.tfinger.y < 0.5f)
-				running = 0;
+				running = 0;  /* swipe-up exit */
+			if (ev.type == SDL_FINGERUP) {
+				/* Tap = finger didn't travel far */
+				float dy = fabsf(ev.tfinger.y - touch_start_y);
+				if (dy < 0.05f) {
+					int btn = hit_test_button(
+						ev.tfinger.x, ev.tfinger.y,
+						WIN_H);
+					if (btn == 0) {
+						if (recording)
+							wav_stop();
+						else
+							wav_start(sample_rate,
+								  channels);
+						buttons[0].active = recording;
+					} else if (btn == 1) {
+						buttons[1].active =
+							!buttons[1].active;
+					} else if (btn == 2) {
+						buttons[2].active =
+							!buttons[2].active;
+						gate_enabled =
+							buttons[2].active;
+					}
+				}
+				swipe_active = 0;
+			}
 		}
 
 		/* Read latest audio block */
@@ -1280,7 +1297,7 @@ int main(int argc, char *argv[])
 		/* Peak hold overlay */
 		draw_peak_hold(ren, peak_db, half_fft,
 			       margin, y_left, left_w, spec_bar_h,
-			       db_floor, db_ceil);
+			       db_floor, db_ceil, sample_rate);
 
 		y_left += spec_bar_h + 3;
 
@@ -1351,9 +1368,12 @@ int main(int argc, char *argv[])
 		}
 		dom_freq_avg = dom_freq_avg * 0.95f + dom_freq_now * 0.05f;
 
+		/* Even slower average for note display — avoids flickering */
+		note_freq_avg = note_freq_avg * 0.98f + dom_freq_now * 0.02f;
+
 		/* Musical note */
 		char note[16];
-		freq_to_note(dom_freq_avg, note, sizeof(note));
+		freq_to_note(note_freq_avg, note, sizeof(note));
 
 		int txt_scale = 2;
 		int line_h = (FONT_H + 2) * txt_scale;
@@ -1442,8 +1462,7 @@ int main(int argc, char *argv[])
 		/* On-screen buttons */
 		draw_buttons(ren, WIN_W, WIN_H);
 
-		SDL_RenderPresent(ren);
-
+		/* Measure render time BEFORE present (which blocks on vsync) */
 		clock_gettime(CLOCK_MONOTONIC, &t_render_end);
 		{
 			float render_us = TDIFF_US(t_render_start, t_render_end);
@@ -1452,6 +1471,8 @@ int main(int argc, char *argv[])
 			cpu_pct = (avg_filter_us + avg_fft_us + avg_render_us) /
 				  budget_us * 100;
 		}
+
+		SDL_RenderPresent(ren);
 	}
 
 	/* Cleanup */
