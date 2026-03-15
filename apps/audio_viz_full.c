@@ -75,8 +75,8 @@ static int gate_enabled = 1;
 static float lp_cutoff = 3000; /* default: 3 kHz low-pass (toggled off initially) */
 static float hp_cutoff = 115;  /* default: mains hum rejection */
 
-/* ALSA playback */
-static const char *playback_device = "default"; /* -o: override output device */
+/* ALSA playback — use plughw for low latency (bypasses PulseAudio) */
+static const char *playback_device = "plughw:0,0";
 static int playback_active = 0;
 
 /* ── 8-band graphic EQ ─────────────────────────────────────────────── */
@@ -644,6 +644,14 @@ static void *playback_thread(void *arg)
 	snd_pcm_uframes_t buf_size;
 	snd_pcm_hw_params_get_buffer_size(hw, &buf_size);
 	playback_latency_ms = (float)buf_size / prate * 1000.0f;
+
+	/* SW params: start playback after first period */
+	snd_pcm_sw_params_t *sw;
+	snd_pcm_sw_params_alloca(&sw);
+	snd_pcm_sw_params_current(pcm, sw);
+	snd_pcm_sw_params_set_start_threshold(pcm, sw, pf);
+	snd_pcm_sw_params(pcm, sw);
+
 	printf("ALSA playback: %s, %u Hz, %u ch, period %lu, buffer %lu (%.1f ms)\n",
 	       playback_device, prate, channels, pf, buf_size,
 	       playback_latency_ms);
