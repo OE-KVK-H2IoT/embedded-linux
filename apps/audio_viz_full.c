@@ -526,6 +526,19 @@ static float find_peak_lag_subsample(const float *corr, int n, int max_lag)
 	return lag;
 }
 
+/* ── Real-time thread priority ──────────────────────────────────────── */
+
+static void try_set_realtime(const char *name, int priority)
+{
+	struct sched_param sp = { .sched_priority = priority };
+	if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
+		printf("[%s] SCHED_FIFO priority %d\n", name, priority);
+	} else {
+		fprintf(stderr, "[%s] Could not set RT priority "
+			"(run as root or set rtprio in limits.conf)\n", name);
+	}
+}
+
 /* ── Audio capture thread ───────────────────────────────────────────── */
 
 static void *audio_thread(void *arg)
@@ -564,6 +577,8 @@ static void *audio_thread(void *arg)
 	int slot_size = channels * period_frames;
 	int32_t *raw_buf = malloc(slot_size * sizeof(int32_t));
 	float *tmp = malloc(slot_size * sizeof(float));
+
+	try_set_realtime("capture", 60);
 
 	while (running) {
 		snd_pcm_sframes_t n = snd_pcm_readi(pcm, raw_buf, period_frames);
@@ -670,6 +685,8 @@ static void *playback_thread(void *arg)
 	       "(accumulate %d capture blocks per write)\n",
 	       (int)period_frames, play_period,
 	       (play_period + (int)period_frames - 1) / (int)period_frames);
+
+	try_set_realtime("playback", 55);
 
 	/* Pre-fill playback buffer with silence to prevent initial underruns */
 	{
