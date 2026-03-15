@@ -2169,11 +2169,20 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		/* Read latest audio block */
+		/* Drain ALL pending audio blocks — feed each to playback,
+		 * keep the last one for display processing.
+		 * Without this, at 256-sample periods (187 blocks/s) the
+		 * 60fps render loop would only process 60 blocks and
+		 * starve the playback thread. */
 		int have_data = 0;
+		int blocks_processed = 0;
 
-		pthread_mutex_lock(&ring_mtx);
-		if (ring_read != ring_write) {
+		for (;;) {
+			pthread_mutex_lock(&ring_mtx);
+			if (ring_read == ring_write) {
+				pthread_mutex_unlock(&ring_mtx);
+				break;
+			}
 			float *src = ring_buf + ring_read * slot_size;
 			capture_ts = ring_ts[ring_read];
 			for (int i = 0; i < (int)period_frames; i++) {
@@ -2182,12 +2191,12 @@ int main(int argc, char *argv[])
 					ch2_buf[i] = src[i * channels + 1];
 			}
 			ring_read = (ring_read + 1) % RING_SLOTS;
-			have_data = 1;
-		}
-		pthread_mutex_unlock(&ring_mtx);
+			pthread_mutex_unlock(&ring_mtx);
 
-		if (have_data) {
-			/* High-pass filter */
+			have_data = 1;
+			blocks_processed++;
+
+			/* Filters run on every block (state must be continuous) */
 			if (hp_cutoff > 0) {
 				highpass_1pole(ch1_buf, period_frames,
 					       &hp_y1, &hp_x1, hp_alpha);
@@ -2196,8 +2205,6 @@ int main(int argc, char *argv[])
 						       &hp_y2, &hp_x2,
 						       hp_alpha);
 			}
-
-			/* Low-pass filter (toggled by FILTER button) */
 			if (lp_cutoff > 0 && buttons[1].active) {
 				lowpass_1pole(ch1_buf, period_frames,
 					      &lp_y1, lp_alpha_val);
@@ -2208,14 +2215,14 @@ int main(int argc, char *argv[])
 
 			if (warmup > 0) { warmup--; have_data = 0; continue; }
 
-			/* 8-band EQ */
+			/* EQ on every block */
 			if (eq_enabled) {
 				eq_apply(ch1_buf, period_frames, 0);
 				if (channels == 2)
 					eq_apply(ch2_buf, period_frames, 1);
 			}
 
-			/* Delay / echo effect */
+			/* Delay on every block */
 			if (delay_enabled && delay_len > 0) {
 				delay_process(ch1_buf, period_frames,
 					      delay_buf_l);
@@ -2224,58 +2231,55 @@ int main(int argc, char *argv[])
 						      delay_buf_r);
 			}
 
-			/* Feed processed audio to playback (with effects) */
+			/* Feed EVERY block to playback */
 			if (playback_active) {
-				/* Work on copies so effects don't alter display */
-				float *pb1 = malloc(period_frames * sizeof(float));
-				float *pb2 = channels == 2 ?
-					malloc(period_frames * sizeof(float)) : NULL;
-				memcpy(pb1, ch1_buf, period_frames * sizeof(float));
-				if (pb2)
+				float pb1[4096], pb2[4096];
+				int pn = period_frames < 4096 ?
+					 (int)period_frames : 4096;
+				memcpy(pb1, ch1_buf, pn * sizeof(float));
+				if (channels == 2)
 					memcpy(pb2, ch2_buf,
-					       period_frames * sizeof(float));
+					       pn * sizeof(float));
 
-				/* Noise reduction */
 				if (noise_reduce) {
-					noise_reduce_process(pb1, period_frames,
+					noise_reduce_process(pb1, pn,
 							     playback_gate_db);
-					if (pb2)
-						noise_reduce_process(pb2,
-							period_frames,
+					if (channels == 2)
+						noise_reduce_process(pb2, pn,
 							playback_gate_db);
 				}
-
-				/* Voice effect */
 				if (fx_mode != FX_NONE) {
-					fx_apply(pb1, period_frames, fx_mode,
+					fx_apply(pb1, pn, fx_mode,
 						 &fx_phase_l);
-					if (pb2)
-						fx_apply(pb2, period_frames,
-							 fx_mode, &fx_phase_r);
+					if (channels == 2)
+						fx_apply(pb2, pn, fx_mode,
+							 &fx_phase_r);
 				}
-
-				/* Soft clip to prevent distortion from high gain */
-				for (int i = 0; i < (int)period_frames; i++) {
+				for (int i = 0; i < pn; i++) {
 					pb1[i] = tanhf(pb1[i]);
-					if (pb2) pb2[i] = tanhf(pb2[i]);
+					if (channels == 2)
+						pb2[i] = tanhf(pb2[i]);
 				}
 
-				playback_feed(pb1, pb2, period_frames);
-				free(pb1);
-				free(pb2);
+				playback_feed(pb1,
+					      channels == 2 ? pb2 : NULL, pn);
 
-				/* Pipeline latency: capture + processing + playback buffer */
 				pipeline_latency_ms =
-					(float)period_frames / sample_rate * 1000.0f +
-					playback_latency_ms;
+					(float)period_frames / sample_rate *
+					1000.0f + playback_latency_ms;
 			}
 
-			/* WAV recording */
+			/* WAV recording (every block) */
 			if (recording) {
 				wav_write_samples(ch1_buf, period_frames);
 				if (channels == 2)
 					wav_write_samples(ch2_buf, period_frames);
 			}
+		} /* end of capture drain loop */
+
+		if (have_data) {
+			/* Display processing runs once per render frame
+			 * on the last captured block (ch1_buf/ch2_buf) */
 
 			/* Append to waveform history */
 			for (int i = 0; i < (int)period_frames; i++) {
