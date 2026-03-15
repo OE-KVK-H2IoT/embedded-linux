@@ -74,7 +74,7 @@ static float lp_cutoff = 5000; /* default: 5 kHz low-pass (toggled off initially
 static float hp_cutoff = 115;  /* default: mains hum rejection */
 
 /* ALSA playback */
-static const char *playback_device = NULL; /* -o: output device, NULL = off */
+static const char *playback_device = "default"; /* -o: override output device */
 static int playback_active = 0;
 
 /* ── 8-band graphic EQ ─────────────────────────────────────────────── */
@@ -489,6 +489,7 @@ static void *playback_thread(void *arg)
 				SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
 		fprintf(stderr, "ALSA playback open '%s': %s\n",
 			playback_device, snd_strerror(err));
+		playback_device = NULL; /* signal: no output available */
 		return NULL;
 	}
 
@@ -1552,7 +1553,7 @@ static void usage(const char *prog)
 		"  -T dB       Noise gate threshold (default: %.0f dB)\n"
 		"  -L Hz       Low-pass cutoff, 0=off (default: %.0f)\n"
 		"  -H Hz       High-pass cutoff (default: %.0f)\n"
-		"  -o DEVICE   ALSA playback device for live output\n"
+		"  -o DEVICE   ALSA playback device (default: 'default')\n"
 		"  -f          Flip direction 180 deg (mics facing you)\n"
 		"  -h          Show this help\n",
 		prog, DEFAULT_DEVICE, DEFAULT_RATE, DEFAULT_CHANNELS,
