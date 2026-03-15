@@ -73,6 +73,52 @@ static int gate_enabled = 1;
 static float lp_cutoff = 5000; /* default: 5 kHz low-pass (toggled off initially) */
 static float hp_cutoff = 115;  /* default: mains hum rejection */
 
+/* ALSA playback */
+static const char *playback_device = NULL; /* -o: output device, NULL = off */
+static int playback_active = 0;
+
+/* ── 8-band graphic EQ ─────────────────────────────────────────────── */
+
+#define EQ_BANDS   8
+#define EQ_MAX_DB  12.0f
+
+typedef struct {
+	float b0, b1, b2, a1, a2; /* normalized (a0 = 1) */
+	float x1, x2, y1, y2;     /* filter state */
+} biquad_t;
+
+typedef struct {
+	float freq;       /* center frequency */
+	float gain_db;    /* current gain (-12 to +12) */
+	float q;          /* bandwidth */
+	biquad_t filt[2]; /* per channel */
+} eq_band_t;
+
+static eq_band_t eq_bands[EQ_BANDS] = {
+	{   60, 0, 1.4f, {{0},{0}} },
+	{  150, 0, 1.4f, {{0},{0}} },
+	{  400, 0, 1.4f, {{0},{0}} },
+	{ 1000, 0, 1.4f, {{0},{0}} },
+	{ 2500, 0, 1.4f, {{0},{0}} },
+	{ 6000, 0, 1.4f, {{0},{0}} },
+	{12000, 0, 1.4f, {{0},{0}} },
+	{16000, 0, 1.4f, {{0},{0}} },
+};
+
+static int eq_enabled = 0;
+static int eq_overlay = 0; /* show EQ overlay */
+
+/* Delay / echo effect */
+#define MAX_DELAY_SAMPLES (48000)  /* max 1 second */
+static float *delay_buf_l = NULL;
+static float *delay_buf_r = NULL;
+static int delay_len = 0;         /* in samples */
+static int delay_pos = 0;
+static float delay_feedback = 0.3f;
+static float delay_mix = 0.4f;
+static int delay_enabled = 0;
+static float delay_ms = 200.0f;   /* default 200ms */
+
 /* Ring buffer */
 static float *ring_buf;
 static struct timespec ring_ts[RING_SLOTS];
@@ -207,6 +253,74 @@ static float compute_peak(const float *buf, int n)
 		if (a > peak) peak = a;
 	}
 	return peak;
+}
+
+/* ── Biquad EQ (peaking filter — Audio EQ Cookbook) ─────────────────── */
+
+static void biquad_compute_peaking(biquad_t *bq, float freq, float gain_db,
+				   float q, float srate)
+{
+	if (fabsf(gain_db) < 0.1f) {
+		/* Bypass: unity gain */
+		bq->b0 = 1; bq->b1 = 0; bq->b2 = 0;
+		bq->a1 = 0; bq->a2 = 0;
+		return;
+	}
+	float A = powf(10.0f, gain_db / 40.0f);
+	float w0 = 2.0f * M_PI * freq / srate;
+	float alpha = sinf(w0) / (2.0f * q);
+
+	float a0  =  1.0f + alpha / A;
+	bq->b0 = (1.0f + alpha * A) / a0;
+	bq->b1 = (-2.0f * cosf(w0)) / a0;
+	bq->b2 = (1.0f - alpha * A) / a0;
+	bq->a1 = (-2.0f * cosf(w0)) / a0;
+	bq->a2 = (1.0f - alpha / A) / a0;
+}
+
+static void biquad_process(biquad_t *bq, float *buf, int n)
+{
+	for (int i = 0; i < n; i++) {
+		float x = buf[i];
+		float y = bq->b0 * x + bq->b1 * bq->x1 + bq->b2 * bq->x2
+			- bq->a1 * bq->y1 - bq->a2 * bq->y2;
+		bq->x2 = bq->x1; bq->x1 = x;
+		bq->y2 = bq->y1; bq->y1 = y;
+		buf[i] = y;
+	}
+}
+
+static void eq_update_coeffs(void)
+{
+	for (int b = 0; b < EQ_BANDS; b++) {
+		for (int ch = 0; ch < 2; ch++)
+			biquad_compute_peaking(&eq_bands[b].filt[ch],
+					       eq_bands[b].freq,
+					       eq_bands[b].gain_db,
+					       eq_bands[b].q,
+					       (float)sample_rate);
+	}
+}
+
+static void eq_apply(float *buf, int n, int ch)
+{
+	for (int b = 0; b < EQ_BANDS; b++)
+		biquad_process(&eq_bands[b].filt[ch], buf, n);
+}
+
+/* ── Delay / echo effect ───────────────────────────────────────────── */
+
+static void delay_process(float *buf, int n, float *dbuf)
+{
+	for (int i = 0; i < n; i++) {
+		int rd = (delay_pos - delay_len + MAX_DELAY_SAMPLES)
+			 % MAX_DELAY_SAMPLES;
+		float delayed = dbuf[rd];
+		float out = buf[i] + delayed * delay_mix;
+		dbuf[delay_pos] = buf[i] + delayed * delay_feedback;
+		delay_pos = (delay_pos + 1) % MAX_DELAY_SAMPLES;
+		buf[i] = out;
+	}
 }
 
 /* ── Musical note detection ─────────────────────────────────────────── */
@@ -353,6 +467,129 @@ static void *audio_thread(void *arg)
 	free(tmp);
 	snd_pcm_close(pcm);
 	return NULL;
+}
+
+/* ── ALSA playback ring buffer ──────────────────────────────────────── */
+
+#define PLAY_RING_SLOTS  8
+static float *play_ring;          /* [PLAY_RING_SLOTS][channels * period_frames] */
+static int play_ring_write = 0;
+static int play_ring_read  = 0;
+static pthread_mutex_t play_mtx = PTHREAD_MUTEX_INITIALIZER;
+static float playback_latency_ms = 0;
+
+static void *playback_thread(void *arg)
+{
+	(void)arg;
+	snd_pcm_t *pcm = NULL;
+	snd_pcm_hw_params_t *hw;
+	int err;
+
+	if ((err = snd_pcm_open(&pcm, playback_device,
+				SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+		fprintf(stderr, "ALSA playback open '%s': %s\n",
+			playback_device, snd_strerror(err));
+		return NULL;
+	}
+
+	snd_pcm_hw_params_alloca(&hw);
+	snd_pcm_hw_params_any(pcm, hw);
+	snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+	snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE);
+	unsigned int prate = sample_rate;
+	snd_pcm_hw_params_set_rate_near(pcm, hw, &prate, NULL);
+	snd_pcm_hw_params_set_channels(pcm, hw, channels);
+
+	/* Try for low latency: 2 periods of period_frames each */
+	snd_pcm_uframes_t pf = period_frames;
+	snd_pcm_hw_params_set_period_size_near(pcm, hw, &pf, NULL);
+	unsigned int periods = 2;
+	snd_pcm_hw_params_set_periods_near(pcm, hw, &periods, NULL);
+
+	if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
+		fprintf(stderr, "ALSA playback hw_params: %s\n",
+			snd_strerror(err));
+		snd_pcm_close(pcm);
+		return NULL;
+	}
+
+	snd_pcm_hw_params_get_period_size(hw, &pf, NULL);
+	snd_pcm_uframes_t buf_size;
+	snd_pcm_hw_params_get_buffer_size(hw, &buf_size);
+	playback_latency_ms = (float)buf_size / prate * 1000.0f;
+	printf("ALSA playback: %s, %u Hz, %u ch, period %lu, buffer %lu (%.1f ms)\n",
+	       playback_device, prate, channels, pf, buf_size,
+	       playback_latency_ms);
+
+	int slot_size = channels * period_frames;
+	int16_t *out_buf = malloc(slot_size * sizeof(int16_t));
+
+	while (running) {
+		/* Wait for data */
+		int have = 0;
+		float *src = NULL;
+
+		pthread_mutex_lock(&play_mtx);
+		if (play_ring_read != play_ring_write) {
+			src = play_ring + play_ring_read * slot_size;
+			have = 1;
+		}
+		pthread_mutex_unlock(&play_mtx);
+
+		if (!have) {
+			usleep(1000); /* 1ms poll — avoids busy-wait */
+			continue;
+		}
+
+		/* Convert float → S16_LE */
+		for (int i = 0; i < slot_size; i++) {
+			float s = src[i];
+			if (s > 1.0f) s = 1.0f;
+			if (s < -1.0f) s = -1.0f;
+			out_buf[i] = (int16_t)(s * 32767);
+		}
+
+		pthread_mutex_lock(&play_mtx);
+		play_ring_read = (play_ring_read + 1) % PLAY_RING_SLOTS;
+		pthread_mutex_unlock(&play_mtx);
+
+		snd_pcm_sframes_t n = snd_pcm_writei(pcm, out_buf, period_frames);
+		if (n < 0) {
+			n = snd_pcm_recover(pcm, (int)n, 0);
+			if (n < 0)
+				fprintf(stderr, "ALSA write error: %s\n",
+					snd_strerror((int)n));
+		}
+	}
+
+	free(out_buf);
+	snd_pcm_drain(pcm);
+	snd_pcm_close(pcm);
+	return NULL;
+}
+
+static void playback_feed(const float *ch1, const float *ch2, int n)
+{
+	if (!playback_active || !playback_device) return;
+	int slot_size = channels * n;
+
+	pthread_mutex_lock(&play_mtx);
+	float *dst = play_ring + play_ring_write * slot_size;
+
+	/* Interleave channels */
+	if (channels == 2 && ch2) {
+		for (int i = 0; i < n; i++) {
+			dst[i * 2]     = ch1[i];
+			dst[i * 2 + 1] = ch2[i];
+		}
+	} else {
+		memcpy(dst, ch1, n * sizeof(float));
+	}
+
+	play_ring_write = (play_ring_write + 1) % PLAY_RING_SLOTS;
+	if (play_ring_write == play_ring_read)
+		play_ring_read = (play_ring_read + 1) % PLAY_RING_SLOTS;
+	pthread_mutex_unlock(&play_mtx);
 }
 
 /* ── Forward declarations ───────────────────────────────────────────── */
@@ -617,7 +854,7 @@ static void draw_direction_indicator(SDL_Renderer *r, float angle_deg,
 
 /* ── On-screen touch buttons ────────────────────────────────────────── */
 
-#define BTN_COUNT 3
+#define BTN_COUNT 5
 #define BTN_H     36
 
 typedef struct {
@@ -631,6 +868,8 @@ static touch_btn_t buttons[BTN_COUNT] = {
 	{ "REC",    0, 255, 60, 60,   0.0f, 0.0f },
 	{ "FILTER", 0, 60, 200, 255,  0.0f, 0.0f },
 	{ "GATE",   1, 60, 255, 120,  0.0f, 0.0f },
+	{ "EQ",     0, 255, 200, 50,  0.0f, 0.0f },
+	{ "PLAY",   0, 50, 255, 50,   0.0f, 0.0f },
 };
 
 static void layout_buttons(int win_w, int win_h)
@@ -692,6 +931,231 @@ static int hit_test_button(float fx, float fy, int win_h)
 			return i;
 	}
 	return -1;
+}
+
+/* ── EQ overlay ────────────────────────────────────────────────────── */
+
+static int eq_dragging = -1; /* band index being dragged, -1 = none */
+
+static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
+{
+	int margin = 30;
+	int ox = margin, oy = margin;
+	int ow = win_w - 2 * margin;
+	int oh = win_h - 2 * margin;
+
+	/* Semi-transparent background */
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(r, 10, 10, 15, 220);
+	SDL_Rect bg = { ox, oy, ow, oh };
+	SDL_RenderFillRect(r, &bg);
+	SDL_SetRenderDrawColor(r, 80, 80, 100, 255);
+	SDL_RenderDrawRect(r, &bg);
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+	/* Title */
+	SDL_SetRenderDrawColor(r, 200, 200, 220, 255);
+	draw_text(r, "EQUALIZER", ox + 10, oy + 8, 2);
+
+	/* Close hint */
+	SDL_SetRenderDrawColor(r, 120, 120, 140, 255);
+	draw_text(r, "tap EQ to close", ox + ow - 180, oy + 8, 2);
+
+	/* Band sliders area */
+	int slider_top = oy + 40;
+	int slider_bot = oy + oh - 70;
+	int slider_h = slider_bot - slider_top;
+	int slider_mid = slider_top + slider_h / 2;
+	int band_w = (ow - 40) / (EQ_BANDS + 2); /* extra space for delay */
+	int bx0 = ox + 20;
+
+	/* Zero line */
+	SDL_SetRenderDrawColor(r, 50, 50, 60, 255);
+	SDL_RenderDrawLine(r, ox + 10, slider_mid, ox + ow - 10, slider_mid);
+
+	/* Grid lines at +6, -6, +12, -12 dB */
+	SDL_SetRenderDrawColor(r, 35, 35, 45, 255);
+	for (float db = -12; db <= 12; db += 6) {
+		if (fabsf(db) < 0.1f) continue;
+		int gy = slider_mid - (int)(db / EQ_MAX_DB * slider_h / 2);
+		SDL_RenderDrawLine(r, ox + 10, gy, ox + ow - 10, gy);
+	}
+
+	/* dB labels */
+	SDL_SetRenderDrawColor(r, 90, 90, 100, 255);
+	char lbl[8];
+	snprintf(lbl, sizeof(lbl), "+%d", (int)EQ_MAX_DB);
+	draw_text(r, lbl, ox + 2, slider_top - 2, 1);
+	snprintf(lbl, sizeof(lbl), "-%d", (int)EQ_MAX_DB);
+	draw_text(r, lbl, ox + 2, slider_bot - 6, 1);
+	draw_text(r, "0dB", ox + 2, slider_mid - 3, 1);
+
+	/* EQ band sliders */
+	for (int b = 0; b < EQ_BANDS; b++) {
+		int cx = bx0 + b * band_w + band_w / 2;
+		float norm = eq_bands[b].gain_db / EQ_MAX_DB; /* -1..+1 */
+		int bar_top = slider_mid;
+		int bar_bot = slider_mid - (int)(norm * slider_h / 2);
+		if (bar_top > bar_bot) { int t = bar_top; bar_top = bar_bot; bar_bot = t; }
+
+		/* Slider track */
+		SDL_SetRenderDrawColor(r, 50, 50, 60, 255);
+		SDL_RenderDrawLine(r, cx, slider_top, cx, slider_bot);
+
+		/* Bar fill */
+		Uint8 cr = norm > 0 ? 80 : 50;
+		Uint8 cg = norm > 0 ? 200 : 120;
+		Uint8 cb = 255;
+		SDL_SetRenderDrawColor(r, cr, cg, cb, 200);
+		SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+		int bw = band_w - 8;
+		if (bw < 6) bw = 6;
+		SDL_Rect bar = { cx - bw/2, bar_top, bw, bar_bot - bar_top };
+		SDL_RenderFillRect(r, &bar);
+		SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+		/* Thumb */
+		int ty = slider_mid - (int)(norm * slider_h / 2);
+		SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+		SDL_Rect thumb = { cx - bw/2, ty - 3, bw, 6 };
+		SDL_RenderFillRect(r, &thumb);
+
+		/* Frequency label */
+		SDL_SetRenderDrawColor(r, 160, 170, 180, 255);
+		char flbl[8];
+		if (eq_bands[b].freq >= 1000)
+			snprintf(flbl, sizeof(flbl), "%dk",
+				 (int)(eq_bands[b].freq / 1000));
+		else
+			snprintf(flbl, sizeof(flbl), "%d",
+				 (int)eq_bands[b].freq);
+		int tw = strlen(flbl) * 6;
+		draw_text(r, flbl, cx - tw / 2, slider_bot + 6, 1);
+
+		/* Gain label */
+		snprintf(flbl, sizeof(flbl), "%+.0f",
+			 eq_bands[b].gain_db);
+		tw = strlen(flbl) * 6;
+		SDL_SetRenderDrawColor(r, 140, 160, 180, 255);
+		draw_text(r, flbl, cx - tw / 2, slider_bot + 16, 1);
+	}
+
+	/* Delay slider */
+	{
+		int cx = bx0 + EQ_BANDS * band_w + band_w + band_w / 2;
+		float norm = delay_ms / 1000.0f; /* 0..1 */
+		int bar_h = (int)(norm * slider_h);
+
+		SDL_SetRenderDrawColor(r, 50, 50, 60, 255);
+		SDL_RenderDrawLine(r, cx, slider_top, cx, slider_bot);
+
+		SDL_SetRenderDrawColor(r, 255, 180, 50, 180);
+		SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+		int bw = band_w - 8;
+		if (bw < 6) bw = 6;
+		SDL_Rect bar = { cx - bw/2, slider_bot - bar_h, bw, bar_h };
+		SDL_RenderFillRect(r, &bar);
+		SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+		/* Thumb */
+		int ty = slider_bot - bar_h;
+		SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+		SDL_Rect thumb = { cx - bw/2, ty - 3, bw, 6 };
+		SDL_RenderFillRect(r, &thumb);
+
+		SDL_SetRenderDrawColor(r, 160, 170, 180, 255);
+		draw_text(r, "DELAY", cx - 15, slider_bot + 6, 1);
+
+		char dlbl[16];
+		snprintf(dlbl, sizeof(dlbl), "%dms", (int)delay_ms);
+		int tw = strlen(dlbl) * 6;
+		draw_text(r, dlbl, cx - tw / 2, slider_bot + 16, 1);
+	}
+
+	/* Status line at bottom */
+	int sy = oy + oh - 30;
+	SDL_SetRenderDrawColor(r, 140, 160, 180, 255);
+	char status[80];
+
+	if (playback_device) {
+		float total_lat = playback_latency_ms +
+				  (float)period_frames / sample_rate * 1000.0f;
+		snprintf(status, sizeof(status),
+			 "EQ %s  Delay %s  Playback %s  Latency %.0fms",
+			 eq_enabled ? "ON" : "OFF",
+			 delay_enabled ? "ON" : "OFF",
+			 playback_active ? "ON" : "OFF",
+			 total_lat);
+	} else {
+		snprintf(status, sizeof(status),
+			 "EQ %s  Delay %s  No output device (-o)",
+			 eq_enabled ? "ON" : "OFF",
+			 delay_enabled ? "ON" : "OFF");
+	}
+	draw_text(r, status, ox + 10, sy, 2);
+}
+
+/* Returns band index (0..EQ_BANDS-1), EQ_BANDS for delay, or -1 */
+static int eq_hit_test(float fx, float fy, int win_w, int win_h)
+{
+	int margin = 30;
+	int ox = margin, oy = margin;
+	int ow = win_w - 2 * margin;
+	int oh = win_h - 2 * margin;
+	int slider_top = oy + 40;
+	int slider_bot = oy + oh - 70;
+	int band_w = (ow - 40) / (EQ_BANDS + 2);
+	int bx0 = ox + 20;
+
+	int px = (int)(fx * win_w);
+	int py = (int)(fy * win_h);
+
+	if (py < slider_top - 10 || py > slider_bot + 10) return -1;
+
+	for (int b = 0; b < EQ_BANDS; b++) {
+		int cx = bx0 + b * band_w + band_w / 2;
+		if (abs(px - cx) < band_w / 2)
+			return b;
+	}
+	/* Delay slider */
+	int dcx = bx0 + EQ_BANDS * band_w + band_w + band_w / 2;
+	if (abs(px - dcx) < band_w / 2)
+		return EQ_BANDS;
+
+	return -1;
+}
+
+static void eq_drag_update(float fy, int win_h)
+{
+	int margin = 30;
+	int oy = margin;
+	int oh = win_h - 2 * margin;
+	int slider_top = oy + 40;
+	int slider_bot = oy + oh - 70;
+	int slider_h = slider_bot - slider_top;
+	int slider_mid = slider_top + slider_h / 2;
+
+	int py = (int)(fy * win_h);
+
+	if (eq_dragging >= 0 && eq_dragging < EQ_BANDS) {
+		/* Map pixel to dB */
+		float norm = (float)(slider_mid - py) / (slider_h / 2.0f);
+		if (norm > 1) norm = 1;
+		if (norm < -1) norm = -1;
+		eq_bands[eq_dragging].gain_db = norm * EQ_MAX_DB;
+		eq_update_coeffs();
+		eq_enabled = 1;
+	} else if (eq_dragging == EQ_BANDS) {
+		/* Delay slider: map pixel to ms (0-1000) */
+		float norm = (float)(slider_bot - py) / slider_h;
+		if (norm < 0) norm = 0;
+		if (norm > 1) norm = 1;
+		delay_ms = norm * 1000.0f;
+		delay_len = (int)(delay_ms / 1000.0f * sample_rate);
+		if (delay_len >= MAX_DELAY_SAMPLES)
+			delay_len = MAX_DELAY_SAMPLES - 1;
+		delay_enabled = (delay_ms > 5.0f);
+	}
 }
 
 /* ── 5x7 rounded font ──────────────────────────────────────────────── */
@@ -808,6 +1272,7 @@ static void usage(const char *prog)
 		"  -T dB       Noise gate threshold (default: %.0f dB)\n"
 		"  -L Hz       Low-pass cutoff, 0=off (default: %.0f)\n"
 		"  -H Hz       High-pass cutoff (default: %.0f)\n"
+		"  -o DEVICE   ALSA playback device for live output\n"
 		"  -f          Flip direction 180 deg (mics facing you)\n"
 		"  -h          Show this help\n",
 		prog, DEFAULT_DEVICE, DEFAULT_RATE, DEFAULT_CHANNELS,
@@ -821,7 +1286,7 @@ static void usage(const char *prog)
 int main(int argc, char *argv[])
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:T:L:H:fh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:T:L:H:o:fh")) != -1) {
 		switch (opt) {
 		case 'd': alsa_device = optarg; break;
 		case 'r': sample_rate = atoi(optarg); break;
@@ -833,6 +1298,7 @@ int main(int argc, char *argv[])
 		case 'T': gate_threshold_db = atof(optarg); break;
 		case 'L': lp_cutoff = atof(optarg); break;
 		case 'H': hp_cutoff = atof(optarg); break;
+		case 'o': playback_device = optarg; break;
 		case 'f': flip_dir = 1; break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
@@ -850,6 +1316,8 @@ int main(int argc, char *argv[])
 	buttons[0].active = 0;             /* REC — off */
 	buttons[1].active = 0;             /* FILTER (low-pass) — off by default */
 	buttons[2].active = gate_enabled;  /* GATE — on by default */
+	buttons[3].active = 0;             /* EQ overlay — off */
+	buttons[4].active = 0;             /* PLAY — off */
 
 	/* Allocate ring buffer */
 	int slot_size = channels * period_frames;
@@ -984,9 +1452,24 @@ int main(int argc, char *argv[])
 	/* Layout buttons */
 	layout_buttons(WIN_W, WIN_H);
 
+	/* EQ + delay init */
+	eq_update_coeffs();
+	delay_buf_l = calloc(MAX_DELAY_SAMPLES, sizeof(float));
+	delay_buf_r = calloc(MAX_DELAY_SAMPLES, sizeof(float));
+	delay_len = (int)(delay_ms / 1000.0f * sample_rate);
+
+	/* Playback ring buffer + thread */
+	int play_slot_size = channels * period_frames;
+	play_ring = calloc(PLAY_RING_SLOTS * play_slot_size, sizeof(float));
+	pthread_t play_tid = 0;
+	if (playback_device) {
+		pthread_create(&play_tid, NULL, playback_thread, NULL);
+		printf("Playback device: %s\n", playback_device);
+	}
+
 	printf("FFT size: %d, bins: %d, max_lag: %d\n", fft_size, half_fft, max_lag);
 	printf("Features: peak hold, noise gate (%.0f dB), note tuner, "
-	       "WAV rec, band-pass, sub-sample TDOA, CPU budget\n",
+	       "WAV rec, band-pass, EQ, delay, playback\n",
 	       gate_threshold_db);
 
 	/* ── Main loop ──────────────────────────────────────────────── */
@@ -1020,17 +1503,38 @@ int main(int argc, char *argv[])
 					buttons[2].active = !buttons[2].active;
 					gate_enabled = buttons[2].active;
 					break;
+				case SDLK_e:
+					eq_overlay = !eq_overlay;
+					buttons[3].active = eq_overlay;
+					break;
+				case SDLK_p:
+					if (playback_device) {
+						playback_active = !playback_active;
+						buttons[4].active = playback_active;
+					}
+					break;
 				}
 			}
 			/* Touch: track start position for tap vs swipe */
 			if (ev.type == SDL_FINGERDOWN) {
 				touch_start_y = ev.tfinger.y;
-				if (ev.tfinger.y > 0.85f)
+				if (eq_overlay) {
+					eq_dragging = eq_hit_test(
+						ev.tfinger.x, ev.tfinger.y,
+						WIN_W, WIN_H);
+					if (eq_dragging >= 0)
+						eq_drag_update(ev.tfinger.y,
+							       WIN_H);
+				}
+				if (ev.tfinger.y > 0.85f && eq_dragging < 0)
 					swipe_active = 1;
 			}
-			if (ev.type == SDL_FINGERMOTION && swipe_active &&
-			    ev.tfinger.y < 0.5f)
-				running = 0;  /* swipe-up exit */
+			if (ev.type == SDL_FINGERMOTION) {
+				if (eq_dragging >= 0)
+					eq_drag_update(ev.tfinger.y, WIN_H);
+				else if (swipe_active && ev.tfinger.y < 0.5f)
+					running = 0;
+			}
 			if (ev.type == SDL_FINGERUP) {
 				/* Tap = finger didn't travel far */
 				float dy = fabsf(ev.tfinger.y - touch_start_y);
@@ -1053,9 +1557,20 @@ int main(int argc, char *argv[])
 							!buttons[2].active;
 						gate_enabled =
 							buttons[2].active;
+					} else if (btn == 3) {
+						eq_overlay = !eq_overlay;
+						buttons[3].active = eq_overlay;
+					} else if (btn == 4) {
+						if (playback_device) {
+							playback_active =
+								!playback_active;
+							buttons[4].active =
+								playback_active;
+						}
 					}
 				}
 				swipe_active = 0;
+				eq_dragging = -1;
 			}
 		}
 
@@ -1097,6 +1612,28 @@ int main(int argc, char *argv[])
 			}
 
 			if (warmup > 0) { warmup--; have_data = 0; continue; }
+
+			/* 8-band EQ */
+			if (eq_enabled) {
+				eq_apply(ch1_buf, period_frames, 0);
+				if (channels == 2)
+					eq_apply(ch2_buf, period_frames, 1);
+			}
+
+			/* Delay / echo effect */
+			if (delay_enabled && delay_len > 0) {
+				delay_process(ch1_buf, period_frames,
+					      delay_buf_l);
+				if (channels == 2)
+					delay_process(ch2_buf, period_frames,
+						      delay_buf_r);
+			}
+
+			/* Feed processed audio to playback */
+			if (playback_active)
+				playback_feed(ch1_buf,
+					      channels == 2 ? ch2_buf : NULL,
+					      period_frames);
 
 			/* WAV recording */
 			if (recording) {
@@ -1468,12 +2005,21 @@ int main(int argc, char *argv[])
 		/* On-screen buttons */
 		draw_buttons(ren, WIN_W, WIN_H);
 
+		/* EQ overlay (drawn on top of everything) */
+		if (eq_overlay)
+			draw_eq_overlay(ren, WIN_W, WIN_H);
+
 		SDL_RenderPresent(ren);
 	}
 
 	/* Cleanup */
 	wav_stop();
 	pthread_join(audio_tid, NULL);
+	if (play_tid)
+		pthread_join(play_tid, NULL);
+	free(delay_buf_l);
+	free(delay_buf_r);
+	free(play_ring);
 
 	fftwf_destroy_plan(plan_fwd);
 	fftwf_free(fft_in);
