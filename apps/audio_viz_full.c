@@ -119,6 +119,20 @@ static float delay_mix = 0.4f;
 static int delay_enabled = 0;
 static float delay_ms = 200.0f;   /* default 200ms */
 
+/* Pitch shift effect (simple resampling) */
+#define PITCH_BUF_SIZE (48000 * 2) /* 2 seconds max */
+static float *pitch_buf_l = NULL;
+static float *pitch_buf_r = NULL;
+static float pitch_ratio = 1.0f;  /* 1.0 = normal, 2.0 = chipmunk, 0.5 = deep */
+static int pitch_enabled = 0;
+
+/* Noise gate for playback */
+static float playback_gate_db = -45.0f;
+static int noise_reduce = 1; /* on by default */
+
+/* Pipeline latency */
+static float pipeline_latency_ms = 0;
+
 /* Ring buffer */
 static float *ring_buf;
 static struct timespec ring_ts[RING_SLOTS];
@@ -320,6 +334,62 @@ static void delay_process(float *buf, int n, float *dbuf)
 		dbuf[delay_pos] = buf[i] + delayed * delay_feedback;
 		delay_pos = (delay_pos + 1) % MAX_DELAY_SAMPLES;
 		buf[i] = out;
+	}
+}
+
+/* ── Pitch shift (simple linear-interpolation resampling) ───────────── */
+
+static int pitch_write_pos = 0;
+
+static void pitch_shift(float *buf, int n, float *pbuf, float ratio)
+{
+	/* Write input into pitch buffer */
+	for (int i = 0; i < n; i++) {
+		pbuf[pitch_write_pos] = buf[i];
+		pitch_write_pos = (pitch_write_pos + 1) % PITCH_BUF_SIZE;
+	}
+
+	/* Read back at different rate: ratio > 1 = higher pitch (chipmunk),
+	 * ratio < 1 = lower pitch (Darth Vader).
+	 * Uses linear interpolation for smooth output. */
+	static float read_phase = 0;
+	for (int i = 0; i < n; i++) {
+		int idx0 = (int)read_phase % PITCH_BUF_SIZE;
+		int idx1 = (idx0 + 1) % PITCH_BUF_SIZE;
+		float frac = read_phase - (int)read_phase;
+		buf[i] = pbuf[idx0] * (1.0f - frac) + pbuf[idx1] * frac;
+		read_phase += ratio;
+		/* Keep read_phase from drifting too far from write pos */
+		float dist = pitch_write_pos - read_phase;
+		if (dist < 0) dist += PITCH_BUF_SIZE;
+		if (dist > PITCH_BUF_SIZE / 2 || dist < n * 2) {
+			/* Re-sync: snap read to a safe distance behind write */
+			read_phase = (float)((pitch_write_pos - n * 4 +
+					      PITCH_BUF_SIZE) % PITCH_BUF_SIZE);
+		}
+	}
+	/* Wrap phase */
+	while (read_phase >= PITCH_BUF_SIZE) read_phase -= PITCH_BUF_SIZE;
+	while (read_phase < 0) read_phase += PITCH_BUF_SIZE;
+}
+
+/* ── Noise reduction (simple gate + smoothing) ─────────────────────── */
+
+static void noise_reduce_process(float *buf, int n, float gate_db)
+{
+	float rms = 0;
+	for (int i = 0; i < n; i++) rms += buf[i] * buf[i];
+	rms = sqrtf(rms / n);
+	float db = 20.0f * log10f(rms + 1e-10f);
+
+	if (db < gate_db) {
+		/* Below threshold: fade to silence (soft gate) */
+		float atten = (db - gate_db) / 10.0f; /* -10dB fade range */
+		if (atten < -1) atten = -1;
+		float gain_factor = 1.0f + atten; /* 1 at threshold, 0 at -10dB below */
+		if (gain_factor < 0) gain_factor = 0;
+		for (int i = 0; i < n; i++)
+			buf[i] *= gain_factor;
 	}
 }
 
@@ -866,12 +936,12 @@ typedef struct {
 } touch_btn_t;
 
 static touch_btn_t buttons[BTN_COUNT] = {
-	{ "REC",    0, 255, 60, 60,   0.0f, 0.0f },
-	{ "FILTER", 0, 60, 200, 255,  0.0f, 0.0f },
-	{ "GATE",   1, 60, 255, 120,  0.0f, 0.0f },
-	{ "EQ",     0, 255, 200, 50,  0.0f, 0.0f },
-	{ "PLAY",   0, 50, 255, 50,   0.0f, 0.0f },
-	{ "TDOA",   0, 255, 130, 255, 0.0f, 0.0f },
+	{ "REC",  0, 255, 60, 60,   0.0f, 0.0f },
+	{ "FLT",  0, 60, 200, 255,  0.0f, 0.0f },
+	{ "GATE", 1, 60, 255, 120,  0.0f, 0.0f },
+	{ "EQ",   0, 255, 200, 50,  0.0f, 0.0f },
+	{ "PLAY", 0, 50, 255, 50,   0.0f, 0.0f },
+	{ "TDOA", 0, 255, 130, 255, 0.0f, 0.0f },
 };
 
 static int tdoa_overlay = 0;
@@ -916,11 +986,14 @@ static void draw_buttons(SDL_Renderer *r, int win_w, int win_h)
 			SDL_RenderDrawRect(r, &rect);
 		}
 
-		/* Center label */
-		int tw = strlen(buttons[i].label) * 6 * 2; /* approx width at scale 2 */
+		/* Center label — use scale 2, fall back to 1 if too wide */
+		int scale = 2;
+		int tw = strlen(buttons[i].label) * 6 * scale; /* 5px char + 1px gap */
+		if (tw > btn_w - 4) scale = 1;
+		tw = strlen(buttons[i].label) * 6 * scale;
 		int tx = bx + (btn_w - tw) / 2;
-		int ty = by + (BTN_H - 14) / 2;
-		draw_text(r, buttons[i].label, tx, ty, 2);
+		int ty = by + (BTN_H - 7 * scale) / 2;
+		draw_text(r, buttons[i].label, tx, ty, scale);
 	}
 }
 
@@ -1088,9 +1161,42 @@ static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 		draw_text(r, flbl, cx - tw / 2, slider_bot + 16, 1);
 	}
 
+	/* Gain slider */
+	{
+		int cx = bx0 + EQ_BANDS * band_w + band_w / 2;
+		float norm = (gain - 1.0f) / 15.0f; /* 1..16 mapped to 0..1 */
+		if (norm < 0) norm = 0;
+		if (norm > 1) norm = 1;
+		int bar_h = (int)(norm * slider_h);
+
+		SDL_SetRenderDrawColor(r, 50, 50, 60, 255);
+		SDL_RenderDrawLine(r, cx, slider_top, cx, slider_bot);
+
+		SDL_SetRenderDrawColor(r, 50, 200, 50, 180);
+		SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+		int bw = band_w - 8;
+		if (bw < 6) bw = 6;
+		SDL_Rect bar = { cx - bw/2, slider_bot - bar_h, bw, bar_h };
+		SDL_RenderFillRect(r, &bar);
+		SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+		int ty = slider_bot - bar_h;
+		SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+		SDL_Rect thumb = { cx - bw/2, ty - 3, bw, 6 };
+		SDL_RenderFillRect(r, &thumb);
+
+		SDL_SetRenderDrawColor(r, 160, 170, 180, 255);
+		draw_text(r, "GAIN", cx - 12, slider_bot + 6, 1);
+
+		char glbl[8];
+		snprintf(glbl, sizeof(glbl), "%.1f", gain);
+		int tw = strlen(glbl) * 6;
+		draw_text(r, glbl, cx - tw / 2, slider_bot + 16, 1);
+	}
+
 	/* Delay slider */
 	{
-		int cx = bx0 + EQ_BANDS * band_w + band_w + band_w / 2;
+		int cx = bx0 + (EQ_BANDS + 1) * band_w + band_w / 2;
 		float norm = delay_ms / 1000.0f; /* 0..1 */
 		int bar_h = (int)(norm * slider_h);
 
@@ -1120,30 +1226,77 @@ static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 		draw_text(r, dlbl, cx - tw / 2, slider_bot + 16, 1);
 	}
 
+	/* Pitch preset buttons */
+	{
+		int py = oy + oh - 65;
+		const char *presets[] = {
+			"Normal", "Chipmunk", "Deep", "Robot"
+		};
+		float ratios[] = { 1.0f, 1.8f, 0.6f, 0.5f };
+		int n_presets = 4;
+		int pbw = (ow - 40) / n_presets;
+
+		for (int i = 0; i < n_presets; i++) {
+			int px = ox + 20 + i * pbw;
+			SDL_Rect pr = { px, py, pbw - 4, 22 };
+
+			int is_active = pitch_enabled &&
+					fabsf(pitch_ratio - ratios[i]) < 0.05f;
+			if (i == 0) is_active = !pitch_enabled;
+
+			if (is_active) {
+				SDL_SetRenderDrawColor(r, 200, 160, 50, 200);
+				SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+				SDL_RenderFillRect(r, &pr);
+				SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+				SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+			} else {
+				SDL_SetRenderDrawColor(r, 50, 50, 60, 255);
+				SDL_RenderFillRect(r, &pr);
+				SDL_SetRenderDrawColor(r, 160, 160, 180, 255);
+				SDL_RenderDrawRect(r, &pr);
+			}
+			int tw = strlen(presets[i]) * 6;
+			draw_text(r, presets[i], px + (pbw - 4 - tw) / 2,
+				  py + 5, 1);
+		}
+
+		/* Store rects for hit testing */
+		SDL_SetRenderDrawColor(r, 100, 100, 120, 255);
+		draw_text(r, "PITCH:", ox + 4, py + 5, 1);
+	}
+
 	/* Status line at bottom */
 	int sy = oy + oh - 30;
 	SDL_SetRenderDrawColor(r, 140, 160, 180, 255);
-	char status[80];
+	char status[96];
 
-	if (playback_device) {
-		float total_lat = playback_latency_ms +
-				  (float)period_frames / sample_rate * 1000.0f;
+	if (playback_active) {
 		snprintf(status, sizeof(status),
-			 "EQ %s  Delay %s  Playback %s  Latency %.0fms",
-			 eq_enabled ? "ON" : "OFF",
-			 delay_enabled ? "ON" : "OFF",
-			 playback_active ? "ON" : "OFF",
-			 total_lat);
+			 "Pipeline: %.0fms  Noise:%s  Pitch:%.1fx",
+			 pipeline_latency_ms,
+			 noise_reduce ? "ON" : "OFF",
+			 pitch_enabled ? pitch_ratio : 1.0f);
 	} else {
 		snprintf(status, sizeof(status),
-			 "EQ %s  Delay %s  No output device (-o)",
+			 "EQ %s  Delay %s  Playback OFF",
 			 eq_enabled ? "ON" : "OFF",
 			 delay_enabled ? "ON" : "OFF");
 	}
 	draw_text(r, status, ox + 10, sy, 2);
 }
 
-/* Returns band index (0..EQ_BANDS-1), EQ_BANDS for delay, or -1 */
+/* Hit test returns:
+ *   0..7            = EQ band slider
+ *   EQ_BANDS (8)    = gain slider
+ *   EQ_BANDS+1 (9)  = delay slider
+ *   EQ_HIT_PITCH_BASE+0..3 = pitch presets
+ *   -1              = nothing */
+#define EQ_HIT_GAIN     EQ_BANDS
+#define EQ_HIT_DELAY    (EQ_BANDS + 1)
+#define EQ_HIT_PITCH_BASE (EQ_BANDS + 2)
+static const float pitch_presets[] = { 1.0f, 1.8f, 0.6f, 0.5f };
+
 static int eq_hit_test(float fx, float fy, int win_w, int win_h)
 {
 	int margin = 30;
@@ -1158,17 +1311,34 @@ static int eq_hit_test(float fx, float fy, int win_w, int win_h)
 	int px = (int)(fx * win_w);
 	int py = (int)(fy * win_h);
 
-	if (py < slider_top - 10 || py > slider_bot + 10) return -1;
-
-	for (int b = 0; b < EQ_BANDS; b++) {
-		int cx = bx0 + b * band_w + band_w / 2;
-		if (abs(px - cx) < band_w / 2)
-			return b;
+	/* Pitch preset buttons */
+	int pitch_y = oy + oh - 65;
+	if (py >= pitch_y && py <= pitch_y + 22) {
+		int pbw = (ow - 40) / 4;
+		for (int i = 0; i < 4; i++) {
+			int bx = ox + 20 + i * pbw;
+			if (px >= bx && px < bx + pbw - 4)
+				return EQ_HIT_PITCH_BASE + i;
+		}
 	}
-	/* Delay slider */
-	int dcx = bx0 + EQ_BANDS * band_w + band_w + band_w / 2;
-	if (abs(px - dcx) < band_w / 2)
-		return EQ_BANDS;
+
+	/* Sliders area */
+	if (py >= slider_top - 10 && py <= slider_bot + 10) {
+		/* EQ bands */
+		for (int b = 0; b < EQ_BANDS; b++) {
+			int cx = bx0 + b * band_w + band_w / 2;
+			if (abs(px - cx) < band_w / 2)
+				return b;
+		}
+		/* Gain slider */
+		int gcx = bx0 + EQ_BANDS * band_w + band_w / 2;
+		if (abs(px - gcx) < band_w / 2)
+			return EQ_HIT_GAIN;
+		/* Delay slider */
+		int dcx = bx0 + (EQ_BANDS + 1) * band_w + band_w / 2;
+		if (abs(px - dcx) < band_w / 2)
+			return EQ_HIT_DELAY;
+	}
 
 	return -1;
 }
@@ -1186,14 +1356,20 @@ static void eq_drag_update(float fy, int win_h)
 	int py = (int)(fy * win_h);
 
 	if (eq_dragging >= 0 && eq_dragging < EQ_BANDS) {
-		/* Map pixel to dB */
+		/* EQ band: map pixel to dB */
 		float norm = (float)(slider_mid - py) / (slider_h / 2.0f);
 		if (norm > 1) norm = 1;
 		if (norm < -1) norm = -1;
 		eq_bands[eq_dragging].gain_db = norm * EQ_MAX_DB;
 		eq_update_coeffs();
 		eq_enabled = 1;
-	} else if (eq_dragging == EQ_BANDS) {
+	} else if (eq_dragging == EQ_HIT_GAIN) {
+		/* Gain slider: map pixel to 1.0–16.0 */
+		float norm = (float)(slider_bot - py) / slider_h;
+		if (norm < 0) norm = 0;
+		if (norm > 1) norm = 1;
+		gain = 1.0f + norm * 15.0f;
+	} else if (eq_dragging == EQ_HIT_DELAY) {
 		/* Delay slider: map pixel to ms (0-1000) */
 		float norm = (float)(slider_bot - py) / slider_h;
 		if (norm < 0) norm = 0;
@@ -1736,11 +1912,13 @@ int main(int argc, char *argv[])
 	/* Layout buttons */
 	layout_buttons(WIN_W, WIN_H);
 
-	/* EQ + delay init */
+	/* EQ + delay + pitch init */
 	eq_update_coeffs();
 	delay_buf_l = calloc(MAX_DELAY_SAMPLES, sizeof(float));
 	delay_buf_r = calloc(MAX_DELAY_SAMPLES, sizeof(float));
 	delay_len = (int)(delay_ms / 1000.0f * sample_rate);
+	pitch_buf_l = calloc(PITCH_BUF_SIZE, sizeof(float));
+	pitch_buf_r = calloc(PITCH_BUF_SIZE, sizeof(float));
 
 	/* Playback ring buffer + thread */
 	int play_slot_size = channels * period_frames;
@@ -1820,12 +1998,24 @@ int main(int argc, char *argv[])
 						buttons[5].active = 0;
 					}
 				} else if (eq_overlay) {
-					eq_dragging = eq_hit_test(
+					int hit = eq_hit_test(
 						ev.tfinger.x, ev.tfinger.y,
 						WIN_W, WIN_H);
-					if (eq_dragging >= 0)
+					if (hit >= EQ_HIT_PITCH_BASE) {
+						/* Pitch preset button */
+						int pi = hit - EQ_HIT_PITCH_BASE;
+						if (pi == 0) {
+							pitch_enabled = 0;
+							pitch_ratio = 1.0f;
+						} else {
+							pitch_enabled = 1;
+							pitch_ratio = pitch_presets[pi];
+						}
+					} else if (hit >= 0) {
+						eq_dragging = hit;
 						eq_drag_update(ev.tfinger.y,
 							       WIN_H);
+					}
 				}
 				if (ev.tfinger.y > 0.85f && eq_dragging < 0)
 					swipe_active = 1;
@@ -1934,11 +2124,46 @@ int main(int argc, char *argv[])
 						      delay_buf_r);
 			}
 
-			/* Feed processed audio to playback */
-			if (playback_active)
-				playback_feed(ch1_buf,
-					      channels == 2 ? ch2_buf : NULL,
-					      period_frames);
+			/* Feed processed audio to playback (with effects) */
+			if (playback_active) {
+				/* Work on copies so effects don't alter display */
+				float *pb1 = malloc(period_frames * sizeof(float));
+				float *pb2 = channels == 2 ?
+					malloc(period_frames * sizeof(float)) : NULL;
+				memcpy(pb1, ch1_buf, period_frames * sizeof(float));
+				if (pb2)
+					memcpy(pb2, ch2_buf,
+					       period_frames * sizeof(float));
+
+				/* Noise reduction */
+				if (noise_reduce) {
+					noise_reduce_process(pb1, period_frames,
+							     playback_gate_db);
+					if (pb2)
+						noise_reduce_process(pb2,
+							period_frames,
+							playback_gate_db);
+				}
+
+				/* Pitch shift */
+				if (pitch_enabled && fabsf(pitch_ratio - 1.0f) > 0.01f) {
+					pitch_shift(pb1, period_frames,
+						    pitch_buf_l, pitch_ratio);
+					if (pb2)
+						pitch_shift(pb2, period_frames,
+							    pitch_buf_r,
+							    pitch_ratio);
+				}
+
+				playback_feed(pb1, pb2, period_frames);
+				free(pb1);
+				free(pb2);
+
+				/* Pipeline latency: capture + processing + playback buffer */
+				pipeline_latency_ms =
+					(float)period_frames / sample_rate * 1000.0f +
+					playback_latency_ms;
+			}
 
 			/* WAV recording */
 			if (recording) {
@@ -2216,20 +2441,24 @@ int main(int argc, char *argv[])
 		}
 		dom_freq_avg = dom_freq_avg * 0.95f + dom_freq_now * 0.05f;
 
-		/* Note display with hold: only update when stable for 10+ frames */
+		/* Note display with hold: only change when a NEW note is
+		 * stable for 10+ frames. Prevents flickering on boundaries. */
 		note_freq_avg = note_freq_avg * 0.97f + dom_freq_now * 0.03f;
 		{
 			char note_candidate[16];
 			freq_to_note(note_freq_avg, note_candidate,
 				     sizeof(note_candidate));
-			if (strcmp(note_candidate, note_display) == 0) {
+			if (strcmp(note_candidate, note_display) != 0) {
+				/* Different note — count how long it persists */
 				note_hold++;
+				if (note_hold >= 10 ||
+				    strcmp(note_display, "---") == 0)
+					snprintf(note_display,
+						 sizeof(note_display),
+						 "%s", note_candidate);
 			} else {
-				note_hold = 0;
+				note_hold = 0;  /* same as displayed — reset */
 			}
-			if (note_hold >= 10)
-				memcpy(note_display, note_candidate,
-				       sizeof(note_display));
 		}
 
 		int txt_scale = 2;
@@ -2341,6 +2570,8 @@ int main(int argc, char *argv[])
 		pthread_join(play_tid, NULL);
 	free(delay_buf_l);
 	free(delay_buf_r);
+	free(pitch_buf_l);
+	free(pitch_buf_r);
 	free(play_ring);
 
 	fftwf_destroy_plan(plan_fwd);
