@@ -429,46 +429,120 @@ static void fx_apply(float *buf, int n, int mode, float *phase)
 	}
 }
 
-/* ── Noise reduction (adaptive gate + expander) ────────────────────── */
+/* ── Noise reduction (spectral subtraction + expander gate) ────────── */
+/*
+ * 1. During silence, learn the noise spectrum (magnitude per bin)
+ * 2. Subtract the noise spectrum from every frame's FFT
+ * 3. Reconstruct via IFFT → noise removed even while speaking
+ * 4. Apply soft expander gate for residual "musical noise"
+ *
+ * Uses a small dedicated FFT (not the display FFT).
+ */
 
-static float noise_floor_est = 0; /* adaptive noise floor (RMS) */
+#define NR_SIZE 512  /* noise reduction FFT size */
+#define NR_HALF (NR_SIZE / 2 + 1)
+
+static float nr_noise_mag[NR_HALF];  /* estimated noise magnitude spectrum */
+static float nr_floor_rms = 0;       /* adaptive RMS floor for silence detection */
+static int nr_initialized = 0;
+static fftwf_plan nr_fwd = NULL, nr_inv = NULL;
+static float *nr_in = NULL;
+static fftwf_complex *nr_freq = NULL;
+static float *nr_out = NULL;
+
+static void noise_reduce_init(void)
+{
+	if (nr_initialized) return;
+	nr_in  = fftwf_alloc_real(NR_SIZE);
+	nr_out = fftwf_alloc_real(NR_SIZE);
+	nr_freq = fftwf_alloc_complex(NR_HALF);
+	nr_fwd = fftwf_plan_dft_r2c_1d(NR_SIZE, nr_in, nr_freq, FFTW_ESTIMATE);
+	nr_inv = fftwf_plan_dft_c2r_1d(NR_SIZE, nr_freq, nr_out, FFTW_ESTIMATE);
+	memset(nr_noise_mag, 0, sizeof(nr_noise_mag));
+	nr_initialized = 1;
+}
 
 static void noise_reduce_process(float *buf, int n, float gate_db)
 {
 	(void)gate_db;
+	if (!nr_initialized) noise_reduce_init();
+
+	/* Process in NR_SIZE chunks (with overlap for smoothness) */
+	for (int offset = 0; offset + NR_SIZE <= n; offset += NR_SIZE / 2) {
+		/* Window input */
+		for (int i = 0; i < NR_SIZE; i++)
+			nr_in[i] = buf[offset + i] *
+				   (0.5f - 0.5f * cosf(2.0f * M_PI * i / (NR_SIZE - 1)));
+
+		/* Forward FFT */
+		fftwf_execute(nr_fwd);
+
+		/* Compute block RMS for silence detection */
+		float rms = 0;
+		for (int i = 0; i < NR_SIZE; i++)
+			rms += buf[offset + i] * buf[offset + i];
+		rms = sqrtf(rms / NR_SIZE);
+
+		/* Track noise floor (slow adapt up, fast adapt down) */
+		if (rms < nr_floor_rms || nr_floor_rms < 1e-10f)
+			nr_floor_rms = nr_floor_rms * 0.9f + rms * 0.1f;
+		else
+			nr_floor_rms = nr_floor_rms * 0.999f + rms * 0.001f;
+
+		/* Update noise estimate during silence (within 6 dB of floor) */
+		float sig_db = 20.0f * log10f(rms + 1e-10f);
+		float flr_db = 20.0f * log10f(nr_floor_rms + 1e-10f);
+		int is_silence = (sig_db - flr_db) < 6.0f;
+
+		if (is_silence) {
+			for (int i = 0; i < NR_HALF; i++) {
+				float mag = sqrtf(nr_freq[i][0] * nr_freq[i][0] +
+						  nr_freq[i][1] * nr_freq[i][1]);
+				/* Slow update to noise estimate */
+				nr_noise_mag[i] = nr_noise_mag[i] * 0.9f + mag * 0.1f;
+			}
+		}
+
+		/* Spectral subtraction: reduce magnitude, keep phase */
+		float oversubtract = 2.0f; /* subtract 2x noise for cleaner result */
+		float floor_factor = 0.02f; /* don't go below -34 dB (avoids musical noise) */
+		for (int i = 0; i < NR_HALF; i++) {
+			float re = nr_freq[i][0];
+			float im = nr_freq[i][1];
+			float mag = sqrtf(re * re + im * im);
+			float noise = nr_noise_mag[i] * oversubtract;
+			float clean_mag = mag - noise;
+			float min_mag = mag * floor_factor;
+			if (clean_mag < min_mag) clean_mag = min_mag;
+
+			/* Scale complex value to new magnitude */
+			float scale = (mag > 1e-10f) ? clean_mag / mag : 0;
+			nr_freq[i][0] = re * scale;
+			nr_freq[i][1] = im * scale;
+		}
+
+		/* Inverse FFT */
+		fftwf_execute(nr_inv);
+
+		/* Overlap-add back (normalized by FFT size and window) */
+		for (int i = 0; i < NR_SIZE; i++) {
+			float win = 0.5f - 0.5f * cosf(2.0f * M_PI * i / (NR_SIZE - 1));
+			buf[offset + i] = nr_out[i] / NR_SIZE * win;
+		}
+	}
+
+	/* Soft expander gate on residual — kills "musical noise" artifacts */
 	float rms = 0;
 	for (int i = 0; i < n; i++) rms += buf[i] * buf[i];
 	rms = sqrtf(rms / n);
-
-	/* Track noise floor: slowly rises to current RMS, quickly drops.
-	 * This adapts to ambient noise level automatically. */
-	if (rms < noise_floor_est || noise_floor_est < 1e-10f)
-		noise_floor_est = noise_floor_est * 0.95f + rms * 0.05f;
-	else
-		noise_floor_est = noise_floor_est * 0.999f + rms * 0.001f;
-
-	/* Expander: reduce signal that is close to noise floor.
-	 * ratio = how far above noise floor (in dB).
-	 * 0 dB above → full mute, 20 dB above → full volume. */
-	float sig_db = 20.0f * log10f(rms + 1e-10f);
-	float floor_db = 20.0f * log10f(noise_floor_est + 1e-10f);
-	float above_db = sig_db - floor_db;
-
-	float gain_factor;
-	if (above_db < 3.0f) {
-		/* Near or below noise floor — mute */
-		gain_factor = 0;
-	} else if (above_db < 15.0f) {
-		/* Transition zone: 3 to 15 dB above floor */
-		gain_factor = (above_db - 3.0f) / 12.0f;
-	} else {
-		/* Well above noise floor — full volume */
-		gain_factor = 1.0f;
-	}
-
-	if (gain_factor < 1.0f) {
-		for (int i = 0; i < n; i++)
-			buf[i] *= gain_factor;
+	float db = 20.0f * log10f(rms + 1e-10f);
+	float fdb = 20.0f * log10f(nr_floor_rms + 1e-10f);
+	float above = db - fdb;
+	if (above < 2.0f) {
+		for (int i = 0; i < n; i++) buf[i] = 0;
+	} else if (above < 10.0f) {
+		float g = (above - 2.0f) / 8.0f;
+		for (int i = 0; i < n; i++) buf[i] *= g;
 	}
 }
 
@@ -2733,8 +2807,14 @@ int main(int argc, char *argv[])
 		pthread_join(play_tid, NULL);
 	free(delay_buf_l);
 	free(delay_buf_r);
-	/* pitch buffers removed — effects work in-place */
 	free(play_ring);
+	if (nr_initialized) {
+		fftwf_destroy_plan(nr_fwd);
+		fftwf_destroy_plan(nr_inv);
+		fftwf_free(nr_in);
+		fftwf_free(nr_out);
+		fftwf_free(nr_freq);
+	}
 
 	fftwf_destroy_plan(plan_fwd);
 	fftwf_free(fft_in);
