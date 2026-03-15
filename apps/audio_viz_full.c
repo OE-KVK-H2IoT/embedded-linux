@@ -656,11 +656,21 @@ static void *playback_thread(void *arg)
 	       playback_device, prate, channels, pf, buf_size,
 	       playback_latency_ms);
 
-	int slot_size = channels * period_frames;
-	int16_t *out_buf = malloc(slot_size * sizeof(int16_t));
+	/* Accumulation buffer: capture period may differ from playback period.
+	 * Collect capture blocks until we have enough for a playback write. */
+	int cap_slot = channels * period_frames; /* samples per capture block */
+	int play_period = (int)pf;               /* playback device period */
+	int acc_size = channels * play_period;
+	float *acc_buf = calloc(acc_size, sizeof(float));
+	int16_t *out_buf = malloc(acc_size * sizeof(int16_t));
+	int acc_pos = 0; /* how many interleaved samples accumulated */
+
+	printf("Playback: accumulating %d-sample capture blocks into "
+	       "%d-sample playback periods\n",
+	       (int)period_frames, play_period);
 
 	while (running) {
-		/* Wait for data with condvar — wakes immediately on new data */
+		/* Wait for data */
 		pthread_mutex_lock(&play_mtx);
 		while (play_ring_read == play_ring_write && running) {
 			struct timespec ts;
@@ -673,30 +683,37 @@ static void *playback_thread(void *arg)
 			pthread_cond_timedwait(&play_cond, &play_mtx, &ts);
 		}
 		if (!running) { pthread_mutex_unlock(&play_mtx); break; }
-		float *src = play_ring + play_ring_read * slot_size;
-		pthread_mutex_unlock(&play_mtx);
-
-		/* Convert float → S16_LE */
-		for (int i = 0; i < slot_size; i++) {
-			float s = src[i];
-			if (s > 1.0f) s = 1.0f;
-			if (s < -1.0f) s = -1.0f;
-			out_buf[i] = (int16_t)(s * 32767);
-		}
-
-		pthread_mutex_lock(&play_mtx);
+		float *src = play_ring + play_ring_read * cap_slot;
+		/* Copy to accumulation buffer */
+		int to_copy = cap_slot;
+		if (acc_pos + to_copy > acc_size)
+			to_copy = acc_size - acc_pos;
+		memcpy(acc_buf + acc_pos, src, to_copy * sizeof(float));
+		acc_pos += to_copy;
 		play_ring_read = (play_ring_read + 1) % PLAY_RING_SLOTS;
 		pthread_mutex_unlock(&play_mtx);
 
-		snd_pcm_sframes_t n = snd_pcm_writei(pcm, out_buf, period_frames);
-		if (n < 0) {
-			n = snd_pcm_recover(pcm, (int)n, 0);
-			if (n < 0)
-				fprintf(stderr, "ALSA write error: %s\n",
-					snd_strerror((int)n));
+		/* Write to ALSA when we have a full playback period */
+		if (acc_pos >= acc_size) {
+			for (int i = 0; i < acc_size; i++) {
+				float s = acc_buf[i];
+				if (s > 1.0f) s = 1.0f;
+				if (s < -1.0f) s = -1.0f;
+				out_buf[i] = (int16_t)(s * 32767);
+			}
+			snd_pcm_sframes_t n = snd_pcm_writei(pcm, out_buf,
+							      play_period);
+			if (n < 0) {
+				n = snd_pcm_recover(pcm, (int)n, 0);
+				if (n < 0)
+					fprintf(stderr, "ALSA write: %s\n",
+						snd_strerror((int)n));
+			}
+			acc_pos = 0;
 		}
 	}
 
+	free(acc_buf);
 	free(out_buf);
 	snd_pcm_drain(pcm);
 	snd_pcm_close(pcm);
