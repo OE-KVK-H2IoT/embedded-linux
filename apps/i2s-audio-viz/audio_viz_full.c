@@ -2288,12 +2288,15 @@ int main(int argc, char *argv[])
 				int pn = period_frames < 4096 ?
 					 (int)period_frames : 4096;
 
-				/* Keep the gain (I2S mics need it), just
-				 * add headroom to prevent hard clipping */
+				/* Undo display gain for playback — the mic
+				 * signal was amplified for visualization but
+				 * playback needs a natural level. Target ~0.5
+				 * peak for comfortable listening. */
+				float play_gain = 0.5f / (gain > 1 ? gain : 1);
 				for (int i = 0; i < pn; i++) {
-					pb1[i] = ch1_buf[i] * 0.7f;
+					pb1[i] = ch1_buf[i] * play_gain;
 					if (channels == 2)
-						pb2[i] = ch2_buf[i] * 0.7f;
+						pb2[i] = ch2_buf[i] * play_gain;
 				}
 
 				if (noise_reduce) {
