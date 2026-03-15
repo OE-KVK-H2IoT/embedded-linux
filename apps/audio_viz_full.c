@@ -940,6 +940,53 @@ static int hit_test_button(float fx, float fy, int win_h)
 
 static int eq_dragging = -1; /* band index being dragged, -1 = none */
 
+/* Close button: 32x32 X icon in top-right corner of overlay */
+#define CLOSE_BTN_SIZE 32
+#define CLOSE_BTN_MARGIN 6
+
+static void draw_close_button(SDL_Renderer *r, int ox, int oy, int ow)
+{
+	int bx = ox + ow - CLOSE_BTN_SIZE - CLOSE_BTN_MARGIN;
+	int by = oy + CLOSE_BTN_MARGIN;
+	int bs = CLOSE_BTN_SIZE;
+
+	/* Background circle */
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	SDL_SetRenderDrawColor(r, 255, 60, 60, 180);
+	for (int dy = -bs/2; dy <= bs/2; dy++) {
+		int dx = (int)sqrtf((bs/2.0f)*(bs/2.0f) - dy*dy);
+		SDL_RenderDrawLine(r, bx + bs/2 - dx, by + bs/2 + dy,
+				   bx + bs/2 + dx, by + bs/2 + dy);
+	}
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+	/* X lines */
+	int p = 8; /* padding inside circle */
+	SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+	for (int t = -1; t <= 1; t++) {
+		SDL_RenderDrawLine(r, bx + p + t, by + p,
+				   bx + bs - p + t, by + bs - p);
+		SDL_RenderDrawLine(r, bx + bs - p + t, by + p,
+				   bx + p + t, by + bs - p);
+	}
+}
+
+static int close_button_hit(float fx, float fy, int win_w, int win_h)
+{
+	int margin = 30;
+	int ox = margin, oy = margin;
+	int ow = win_w - 2 * margin;
+	int bx = ox + ow - CLOSE_BTN_SIZE - CLOSE_BTN_MARGIN;
+	int by = oy + CLOSE_BTN_MARGIN;
+	int px = (int)(fx * win_w);
+	int py = (int)(fy * win_h);
+	int cx = bx + CLOSE_BTN_SIZE / 2;
+	int cy = by + CLOSE_BTN_SIZE / 2;
+	int dx = px - cx, dy = py - cy;
+	return (dx * dx + dy * dy) <= (CLOSE_BTN_SIZE / 2 + 8) *
+				      (CLOSE_BTN_SIZE / 2 + 8);
+}
+
 static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 {
 	int margin = 30;
@@ -956,13 +1003,10 @@ static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 	SDL_RenderDrawRect(r, &bg);
 	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
 
-	/* Title */
+	/* Title + close button */
 	SDL_SetRenderDrawColor(r, 200, 200, 220, 255);
 	draw_text(r, "EQUALIZER", ox + 10, oy + 8, 2);
-
-	/* Close hint */
-	SDL_SetRenderDrawColor(r, 120, 120, 140, 255);
-	draw_text(r, "tap EQ to close", ox + ow - 180, oy + 8, 2);
+	draw_close_button(r, ox, oy, ow);
 
 	/* Band sliders area */
 	int slider_top = oy + 40;
@@ -1186,8 +1230,7 @@ static void draw_tdoa_overlay(SDL_Renderer *r, int win_w, int win_h,
 	/* Title */
 	SDL_SetRenderDrawColor(r, 200, 200, 220, 255);
 	draw_text(r, "TDOA VISUALIZATION", ox + 10, oy + 8, 2);
-	SDL_SetRenderDrawColor(r, 120, 120, 140, 255);
-	draw_text(r, "tap TDOA to close", ox + ow - 200, oy + 8, 2);
+	draw_close_button(r, ox, oy, ow);
 
 	if (!ch1 || !ch2 || !corr_buf) {
 		SDL_SetRenderDrawColor(r, 140, 140, 160, 255);
@@ -1677,7 +1720,9 @@ int main(int argc, char *argv[])
 	float latency_avg = 0;
 	float rms_db_avg = -60;
 	float dom_freq_avg = 0;
-	float note_freq_avg = 0;  /* even slower EMA for note display */
+	float note_freq_avg = 0;     /* slow EMA for note display */
+	char note_display[16] = "---"; /* held note text */
+	int note_hold = 0;            /* frames the current note has been stable */
 
 	int max_lag = (int)(mic_distance / SPEED_OF_SOUND * sample_rate) + 10;
 	if (max_lag > fft_size / 2) max_lag = fft_size / 2;
@@ -1760,7 +1805,20 @@ int main(int argc, char *argv[])
 			/* Touch: track start position for tap vs swipe */
 			if (ev.type == SDL_FINGERDOWN) {
 				touch_start_y = ev.tfinger.y;
-				if (eq_overlay) {
+				/* Close button on active overlay */
+				if ((eq_overlay || tdoa_overlay) &&
+				    close_button_hit(ev.tfinger.x,
+						     ev.tfinger.y,
+						     WIN_W, WIN_H)) {
+					if (eq_overlay) {
+						eq_overlay = 0;
+						buttons[3].active = 0;
+					}
+					if (tdoa_overlay) {
+						tdoa_overlay = 0;
+						buttons[5].active = 0;
+					}
+				} else if (eq_overlay) {
 					eq_dragging = eq_hit_test(
 						ev.tfinger.x, ev.tfinger.y,
 						WIN_W, WIN_H);
@@ -2157,12 +2215,21 @@ int main(int argc, char *argv[])
 		}
 		dom_freq_avg = dom_freq_avg * 0.95f + dom_freq_now * 0.05f;
 
-		/* Even slower average for note display — avoids flickering */
-		note_freq_avg = note_freq_avg * 0.98f + dom_freq_now * 0.02f;
-
-		/* Musical note */
-		char note[16];
-		freq_to_note(note_freq_avg, note, sizeof(note));
+		/* Note display with hold: only update when stable for 10+ frames */
+		note_freq_avg = note_freq_avg * 0.97f + dom_freq_now * 0.03f;
+		{
+			char note_candidate[16];
+			freq_to_note(note_freq_avg, note_candidate,
+				     sizeof(note_candidate));
+			if (strcmp(note_candidate, note_display) == 0) {
+				note_hold++;
+			} else {
+				note_hold = 0;
+			}
+			if (note_hold >= 10)
+				memcpy(note_display, note_candidate,
+				       sizeof(note_display));
+		}
 
 		int txt_scale = 2;
 		int line_h = (FONT_H + 2) * txt_scale;
@@ -2184,7 +2251,7 @@ int main(int argc, char *argv[])
 			draw_text(ren, stat, right_x, sy, txt_scale);
 			sy += line_h;
 
-			snprintf(stat, sizeof(stat), "Note %s", note);
+			snprintf(stat, sizeof(stat), "Note %s", note_display);
 			draw_text(ren, stat, right_x, sy, txt_scale);
 			sy += line_h;
 
@@ -2232,7 +2299,7 @@ int main(int argc, char *argv[])
 				 latency_avg, rms_db_avg, cpu_pct);
 			snprintf(line2, sizeof(line2),
 				 "Frq %5d Hz  Note %s  Gain %4.1fx",
-				 (int)dom_freq_avg, note, gain);
+				 (int)dom_freq_avg, note_display, gain);
 			SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
 			draw_text(ren, line1, margin, sy, txt_scale);
 			draw_text(ren, line2, margin, sy + line_h, txt_scale);
