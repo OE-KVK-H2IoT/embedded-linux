@@ -41,7 +41,7 @@
 #define DEFAULT_CHANNELS  1
 #define DEFAULT_FRAMES    1024
 #define LOWLAT_FRAMES     256       /* -l: low-latency period size */
-#define RING_SLOTS        4
+#define RING_SLOTS        8         /* capture ring — needs headroom for burst drain */
 
 #define WIN_W             800
 #define WIN_H             480
@@ -75,8 +75,9 @@ static int gate_enabled = 1;
 static float lp_cutoff = 3000; /* default: 3 kHz low-pass (toggled off initially) */
 static float hp_cutoff = 115;  /* default: mains hum rejection */
 
-/* ALSA playback — use plughw for low latency (bypasses PulseAudio) */
-static const char *playback_device = "plughw:0,0";
+/* ALSA playback — 'default' works through PipeWire/PulseAudio which
+ * handles buffering well.  Override with -o for direct hardware. */
+static const char *playback_device = "default";
 static int playback_active = 0;
 
 /* ── 8-band graphic EQ ─────────────────────────────────────────────── */
@@ -596,7 +597,7 @@ static void *audio_thread(void *arg)
 
 /* ── ALSA playback ring buffer ──────────────────────────────────────── */
 
-#define PLAY_RING_SLOTS  3  /* 2 buffered + 1 writing */
+#define PLAY_RING_SLOTS  8  /* enough to absorb render frame jitter */
 static float *play_ring;
 static int play_ring_write = 0;
 static int play_ring_read  = 0;
@@ -627,10 +628,10 @@ static void *playback_thread(void *arg)
 	snd_pcm_hw_params_set_rate_near(pcm, hw, &prate, NULL);
 	snd_pcm_hw_params_set_channels(pcm, hw, channels);
 
-	/* Request 3 periods for more slack against scheduling jitter */
+	/* Request 4 periods for slack against scheduling jitter */
 	snd_pcm_uframes_t pf = period_frames;
 	snd_pcm_hw_params_set_period_size_near(pcm, hw, &pf, NULL);
-	unsigned int nperiods = 3;
+	unsigned int nperiods = 4;
 	snd_pcm_hw_params_set_periods_near(pcm, hw, &nperiods, NULL);
 
 	if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
@@ -685,7 +686,7 @@ static void *playback_thread(void *arg)
 		while (play_ring_read == play_ring_write && running) {
 			struct timespec ts;
 			clock_gettime(CLOCK_REALTIME, &ts);
-			ts.tv_nsec += 10000000; /* 10ms timeout */
+			ts.tv_nsec += 5000000; /* 5ms timeout */
 			if (ts.tv_nsec >= 1000000000) {
 				ts.tv_sec++;
 				ts.tv_nsec -= 1000000000;
