@@ -40,6 +40,7 @@
 #define DEFAULT_RATE      48000
 #define DEFAULT_CHANNELS  1
 #define DEFAULT_FRAMES    1024
+#define LOWLAT_FRAMES     256       /* -l: low-latency period size */
 #define RING_SLOTS        4
 
 #define WIN_W             800
@@ -64,6 +65,7 @@ static float mic_distance = DEFAULT_MIC_DIST;
 static float gain = DEFAULT_GAIN;
 static int wave_ms = DEFAULT_WAVE_MS;
 static int flip_dir = 0;
+static int low_latency = 0;       /* -l: optimize for FX latency */
 
 /* Noise gate */
 static float gate_threshold_db = -40.0f;
@@ -594,11 +596,12 @@ static void *audio_thread(void *arg)
 
 /* ── ALSA playback ring buffer ──────────────────────────────────────── */
 
-#define PLAY_RING_SLOTS  4  /* keep small for low latency */
-static float *play_ring;          /* [PLAY_RING_SLOTS][channels * period_frames] */
+#define PLAY_RING_SLOTS  3  /* 2 buffered + 1 writing */
+static float *play_ring;
 static int play_ring_write = 0;
 static int play_ring_read  = 0;
-static pthread_mutex_t play_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t play_mtx  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  play_cond = PTHREAD_COND_INITIALIZER;
 static float playback_latency_ms = 0;
 
 static void *playback_thread(void *arg)
@@ -624,8 +627,8 @@ static void *playback_thread(void *arg)
 	snd_pcm_hw_params_set_rate_near(pcm, hw, &prate, NULL);
 	snd_pcm_hw_params_set_channels(pcm, hw, channels);
 
-	/* Try for low latency: 2 periods of period_frames each */
-	snd_pcm_uframes_t pf = period_frames;
+	/* Low-latency: use small period + 2 periods buffer */
+	snd_pcm_uframes_t pf = low_latency ? LOWLAT_FRAMES : period_frames;
 	snd_pcm_hw_params_set_period_size_near(pcm, hw, &pf, NULL);
 	unsigned int periods = 2;
 	snd_pcm_hw_params_set_periods_near(pcm, hw, &periods, NULL);
@@ -649,21 +652,21 @@ static void *playback_thread(void *arg)
 	int16_t *out_buf = malloc(slot_size * sizeof(int16_t));
 
 	while (running) {
-		/* Wait for data */
-		int have = 0;
-		float *src = NULL;
-
+		/* Wait for data with condvar — wakes immediately on new data */
 		pthread_mutex_lock(&play_mtx);
-		if (play_ring_read != play_ring_write) {
-			src = play_ring + play_ring_read * slot_size;
-			have = 1;
+		while (play_ring_read == play_ring_write && running) {
+			struct timespec ts;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			ts.tv_nsec += 10000000; /* 10ms timeout */
+			if (ts.tv_nsec >= 1000000000) {
+				ts.tv_sec++;
+				ts.tv_nsec -= 1000000000;
+			}
+			pthread_cond_timedwait(&play_cond, &play_mtx, &ts);
 		}
+		if (!running) { pthread_mutex_unlock(&play_mtx); break; }
+		float *src = play_ring + play_ring_read * slot_size;
 		pthread_mutex_unlock(&play_mtx);
-
-		if (!have) {
-			usleep(1000); /* 1ms poll — avoids busy-wait */
-			continue;
-		}
 
 		/* Convert float → S16_LE */
 		for (int i = 0; i < slot_size; i++) {
@@ -713,6 +716,7 @@ static void playback_feed(const float *ch1, const float *ch2, int n)
 	play_ring_write = (play_ring_write + 1) % PLAY_RING_SLOTS;
 	if (play_ring_write == play_ring_read)
 		play_ring_read = (play_ring_read + 1) % PLAY_RING_SLOTS;
+	pthread_cond_signal(&play_cond);
 	pthread_mutex_unlock(&play_mtx);
 }
 
@@ -1321,17 +1325,21 @@ static void draw_eq_overlay(SDL_Renderer *r, int win_w, int win_h)
 	SDL_SetRenderDrawColor(r, 140, 160, 180, 255);
 	char status[96];
 
-	if (playback_active) {
-		snprintf(status, sizeof(status),
-			 "Pipeline: %.0fms  Noise:%s  FX:%s",
-			 pipeline_latency_ms,
-			 noise_reduce ? "ON" : "OFF",
-			 fx_names[fx_mode]);
-	} else {
-		snprintf(status, sizeof(status),
-			 "EQ %s  Delay %s  Playback OFF",
-			 eq_enabled ? "ON" : "OFF",
-			 delay_enabled ? "ON" : "OFF");
+	{
+		float cap_ms = (float)period_frames / sample_rate * 1000.0f;
+		if (playback_active) {
+			snprintf(status, sizeof(status),
+				 "Cap:%.0fms+Buf:%.0fms=%.0fms  FX:%s",
+				 cap_ms, playback_latency_ms,
+				 pipeline_latency_ms,
+				 fx_names[fx_mode]);
+		} else {
+			snprintf(status, sizeof(status),
+				 "Period:%d (%.0fms)  EQ:%s  Delay:%s",
+				 (int)period_frames, cap_ms,
+				 eq_enabled ? "ON" : "OFF",
+				 delay_enabled ? "ON" : "OFF");
+		}
 	}
 	draw_text(r, status, ox + 10, sy, 2);
 }
@@ -1780,6 +1788,7 @@ static void usage(const char *prog)
 		"  -L Hz       Low-pass cutoff, 0=off (default: %.0f)\n"
 		"  -H Hz       High-pass cutoff (default: %.0f)\n"
 		"  -o DEVICE   ALSA playback device (default: 'default')\n"
+		"  -l          Low-latency mode (256-sample periods for FX)\n"
 		"  -f          Flip direction 180 deg (mics facing you)\n"
 		"  -h          Show this help\n",
 		prog, DEFAULT_DEVICE, DEFAULT_RATE, DEFAULT_CHANNELS,
@@ -1793,7 +1802,7 @@ static void usage(const char *prog)
 int main(int argc, char *argv[])
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:T:L:H:o:fh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:T:L:H:o:lfh")) != -1) {
 		switch (opt) {
 		case 'd': alsa_device = optarg; break;
 		case 'r': sample_rate = atoi(optarg); break;
@@ -1806,6 +1815,7 @@ int main(int argc, char *argv[])
 		case 'L': lp_cutoff = atof(optarg); break;
 		case 'H': hp_cutoff = atof(optarg); break;
 		case 'o': playback_device = optarg; break;
+		case 'l': low_latency = 1; break;
 		case 'f': flip_dir = 1; break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
 		}
@@ -1826,6 +1836,10 @@ int main(int argc, char *argv[])
 	buttons[3].active = 0;             /* EQ overlay — off */
 	buttons[4].active = 0;             /* PLAY — off */
 	buttons[5].active = 0;             /* TDOA viz — off */
+
+	/* Low-latency: use smaller capture periods */
+	if (low_latency && period_frames > LOWLAT_FRAMES)
+		period_frames = LOWLAT_FRAMES;
 
 	/* Allocate ring buffer */
 	int slot_size = channels * period_frames;
@@ -1978,10 +1992,13 @@ int main(int argc, char *argv[])
 		printf("Playback device: %s\n", playback_device);
 	}
 
-	printf("FFT size: %d, bins: %d, max_lag: %d\n", fft_size, half_fft, max_lag);
-	printf("Features: peak hold, noise gate (%.0f dB), note tuner, "
-	       "WAV rec, band-pass, EQ, delay, playback\n",
-	       gate_threshold_db);
+	printf("FFT size: %d, bins: %d, max_lag: %d%s\n",
+	       fft_size, half_fft, max_lag,
+	       low_latency ? " [LOW LATENCY]" : "");
+	printf("Capture period: %.1f ms, theoretical min FX latency: %.1f ms\n",
+	       (float)period_frames / sample_rate * 1000.0f,
+	       (float)period_frames / sample_rate * 1000.0f * 2 +
+	       playback_latency_ms);
 
 	/* ── Main loop ──────────────────────────────────────────────── */
 
@@ -2518,15 +2535,26 @@ int main(int argc, char *argv[])
 			SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
 
 			char stat[32];
-			snprintf(stat, sizeof(stat), "Lat %5.1f ms", latency_avg);
+			snprintf(stat, sizeof(stat), "Vis %5.1fms", latency_avg);
 			draw_text(ren, stat, right_x, sy, txt_scale);
 			sy += line_h;
 
-			snprintf(stat, sizeof(stat), "RMS %5.1f dB", rms_db_avg);
+			if (playback_active) {
+				SDL_SetRenderDrawColor(ren, 100, 255, 100, 255);
+				snprintf(stat, sizeof(stat), "FX  %5.1fms",
+					 pipeline_latency_ms);
+			} else {
+				snprintf(stat, sizeof(stat), "FX   OFF");
+			}
+			draw_text(ren, stat, right_x, sy, txt_scale);
+			SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
+			sy += line_h;
+
+			snprintf(stat, sizeof(stat), "RMS %5.1fdB", rms_db_avg);
 			draw_text(ren, stat, right_x, sy, txt_scale);
 			sy += line_h;
 
-			snprintf(stat, sizeof(stat), "Frq %5d Hz", (int)dom_freq_avg);
+			snprintf(stat, sizeof(stat), "Frq %5dHz", (int)dom_freq_avg);
 			draw_text(ren, stat, right_x, sy, txt_scale);
 			sy += line_h;
 
@@ -2536,7 +2564,7 @@ int main(int argc, char *argv[])
 
 			snprintf(stat, sizeof(stat), "CPU  %4.1f%%", cpu_pct);
 			draw_text(ren, stat, right_x, sy, txt_scale);
-			sy += line_h + 10;
+			sy += line_h + 5;
 
 			/* Recording indicator */
 			if (recording) {
@@ -2574,8 +2602,10 @@ int main(int argc, char *argv[])
 			int sy = y_left + sgram_h + 5;
 			char line1[80], line2[80];
 			snprintf(line1, sizeof(line1),
-				 "Lat %5.1f ms  RMS %5.1f dB  CPU %4.1f%%",
-				 latency_avg, rms_db_avg, cpu_pct);
+				 "Vis %.0fms  FX %.0fms  CPU %4.1f%%",
+				 latency_avg,
+				 playback_active ? pipeline_latency_ms : 0.0f,
+				 cpu_pct);
 			snprintf(line2, sizeof(line2),
 				 "Frq %5d Hz  Note %s  Gain %4.1fx",
 				 (int)dom_freq_avg, note_display, gain);
