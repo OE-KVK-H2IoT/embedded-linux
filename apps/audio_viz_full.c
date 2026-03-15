@@ -337,32 +337,44 @@ static void delay_process(float *buf, int n, float *dbuf)
 	}
 }
 
-/* ── Pitch shift (dual-head overlap-add) ────────────────────────────── */
+/* ── Pitch shift (OLA — Overlap-Add, preserves speed) ──────────────── */
 /*
- * Two read heads (A and B) advance through the input buffer at
- * pitch_ratio speed, offset by half a grain.  Each head reads a
- * grain of GRAIN_SIZE samples with a Hann window.  When a head
- * reaches the end of its grain, it repositions to fresh input
- * and restarts.  The crossfade between heads eliminates clicks.
+ * Changes pitch WITHOUT changing speed. Each grain reads GRAIN_SIZE
+ * consecutive samples from the input (at original speed), but grains
+ * are sourced from positions that jump by hop*ratio instead of hop.
+ *
+ * ratio > 1: grains skip ahead in input → higher pitch, same speed
+ * ratio < 1: grains overlap more in input → lower pitch, same speed
+ *
+ * Two grains overlap at 50% with Hann windows for smooth crossfade.
  */
 
-#define GRAIN_SIZE 2048  /* ~42 ms at 48 kHz — good balance of quality vs latency */
+#define GRAIN_SIZE 2048  /* ~42 ms at 48 kHz */
+#define GRAIN_HOP  (GRAIN_SIZE / 2)
 
 typedef struct {
-	float phase;       /* fractional read position in pitch buffer */
-	int grain_pos;     /* samples read in current grain (0..GRAIN_SIZE-1) */
+	float start;    /* start position in ring buffer */
+	int pos;        /* sample index within grain */
 	int active;
-} pitch_head_t;
+} ola_grain_t;
 
 static int pitch_write_pos = 0;
-static pitch_head_t ph_heads[2] = {{0, 0, 1}, {0, 0, 1}};
 static int ph_initialized = 0;
+
+/* Per-channel state (separate read positions for L/R) */
+typedef struct {
+	ola_grain_t grains[2];
+	int hop_count;       /* samples since last grain start */
+	float input_pos;     /* where next grain reads from */
+} pitch_state_t;
+
+static pitch_state_t ps_l = {{{0,0,0},{0,0,0}}, 0, 0};
+static pitch_state_t ps_r = {{{0,0,0},{0,0,0}}, 0, 0};
 
 static float pitch_interp(const float *pbuf, float phase)
 {
-	int idx0 = (int)phase;
-	if (idx0 < 0) idx0 += PITCH_BUF_SIZE;
-	idx0 = idx0 % PITCH_BUF_SIZE;
+	while (phase < 0) phase += PITCH_BUF_SIZE;
+	int idx0 = (int)phase % PITCH_BUF_SIZE;
 	int idx1 = (idx0 + 1) % PITCH_BUF_SIZE;
 	float frac = phase - floorf(phase);
 	return pbuf[idx0] * (1.0f - frac) + pbuf[idx1] * frac;
@@ -370,53 +382,74 @@ static float pitch_interp(const float *pbuf, float phase)
 
 static void pitch_shift(float *buf, int n, float *pbuf, float ratio)
 {
-	/* Write input into circular pitch buffer */
+	/* Write input into circular buffer */
 	for (int i = 0; i < n; i++) {
 		pbuf[pitch_write_pos] = buf[i];
 		pitch_write_pos = (pitch_write_pos + 1) % PITCH_BUF_SIZE;
 	}
 
-	/* Initialize heads on first call */
+	/* Pick per-channel state */
+	pitch_state_t *ps = (pbuf == pitch_buf_l) ? &ps_l : &ps_r;
+
+	/* Initialize on first call */
 	if (!ph_initialized) {
-		ph_heads[0].phase = (float)((pitch_write_pos - GRAIN_SIZE * 2 +
-					     PITCH_BUF_SIZE) % PITCH_BUF_SIZE);
-		ph_heads[0].grain_pos = 0;
-		ph_heads[1].phase = ph_heads[0].phase + GRAIN_SIZE / 2.0f;
-		ph_heads[1].grain_pos = GRAIN_SIZE / 2;
-		ph_initialized = 1;
+		ps->input_pos = (float)((pitch_write_pos - GRAIN_SIZE * 3 +
+					 PITCH_BUF_SIZE) % PITCH_BUF_SIZE);
+		ps->hop_count = GRAIN_HOP; /* trigger first grain immediately */
+		ps->grains[0].active = 0;
+		ps->grains[1].active = 0;
+		/* Only set flag after both channels init (caller does L then R) */
+		if (pbuf == pitch_buf_r || channels == 1)
+			ph_initialized = 1;
 	}
 
 	for (int i = 0; i < n; i++) {
+		/* Start a new grain every GRAIN_HOP output samples */
+		if (ps->hop_count >= GRAIN_HOP) {
+			ps->hop_count = 0;
+
+			/* Find free slot (or steal oldest) */
+			int slot = -1;
+			if (!ps->grains[0].active) slot = 0;
+			else if (!ps->grains[1].active) slot = 1;
+			else slot = ps->grains[0].pos > ps->grains[1].pos ? 0 : 1;
+
+			ps->grains[slot].start = ps->input_pos;
+			ps->grains[slot].pos = 0;
+			ps->grains[slot].active = 1;
+
+			/* Advance input read position by hop * ratio.
+			 * This is what changes pitch:
+			 *   ratio=2 → skip 2x content → higher pitch
+			 *   ratio=0.5 → re-read content → lower pitch */
+			ps->input_pos += (float)GRAIN_HOP * ratio;
+			while (ps->input_pos >= PITCH_BUF_SIZE)
+				ps->input_pos -= PITCH_BUF_SIZE;
+
+			/* Safety: keep input_pos from getting too far from write.
+			 * For ratio>1 it can catch up; for ratio<1 it falls behind. */
+			float dist = pitch_write_pos - ps->input_pos;
+			while (dist < 0) dist += PITCH_BUF_SIZE;
+			if (dist > PITCH_BUF_SIZE * 0.8f || dist < GRAIN_SIZE)
+				ps->input_pos = (float)((pitch_write_pos -
+					GRAIN_SIZE * 3 + PITCH_BUF_SIZE) %
+					PITCH_BUF_SIZE);
+		}
+		ps->hop_count++;
+
+		/* Mix active grains with Hann windows */
 		float out = 0;
+		for (int g = 0; g < 2; g++) {
+			if (!ps->grains[g].active) continue;
 
-		for (int h = 0; h < 2; h++) {
-			pitch_head_t *hd = &ph_heads[h];
-
-			/* Hann window for this position in the grain */
-			float t = (float)hd->grain_pos / GRAIN_SIZE;
+			float t = (float)ps->grains[g].pos / GRAIN_SIZE;
 			float win = 0.5f * (1.0f - cosf(2.0f * M_PI * t));
+			float rpos = ps->grains[g].start + ps->grains[g].pos;
+			out += pitch_interp(pbuf, rpos) * win;
 
-			/* Read with interpolation */
-			out += pitch_interp(pbuf, hd->phase) * win;
-
-			/* Advance read position */
-			hd->phase += ratio;
-			while (hd->phase >= PITCH_BUF_SIZE)
-				hd->phase -= PITCH_BUF_SIZE;
-			while (hd->phase < 0)
-				hd->phase += PITCH_BUF_SIZE;
-
-			hd->grain_pos++;
-
-			/* Reset grain: reposition to fresh input */
-			if (hd->grain_pos >= GRAIN_SIZE) {
-				hd->grain_pos = 0;
-				/* Place read head behind write pos */
-				hd->phase = (float)((pitch_write_pos -
-						     GRAIN_SIZE * 2 +
-						     PITCH_BUF_SIZE) %
-						    PITCH_BUF_SIZE);
-			}
+			ps->grains[g].pos++;
+			if (ps->grains[g].pos >= GRAIN_SIZE)
+				ps->grains[g].active = 0;
 		}
 
 		buf[i] = out;
