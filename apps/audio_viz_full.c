@@ -976,9 +976,10 @@ int main(int argc, char *argv[])
 	int max_lag = (int)(mic_distance / SPEED_OF_SOUND * sample_rate) + 10;
 	if (max_lag > fft_size / 2) max_lag = fft_size / 2;
 
-	/* CPU budget timing */
-	float avg_filter_us = 0, avg_fft_us = 0, avg_render_us = 0;
+	/* System CPU from /proc/stat */
 	float cpu_pct = 0;
+	unsigned long prev_total = 0, prev_idle = 0;
+	int cpu_poll_count = 0;
 
 	/* Layout buttons */
 	layout_buttons(WIN_W, WIN_H);
@@ -1060,7 +1061,6 @@ int main(int argc, char *argv[])
 
 		/* Read latest audio block */
 		int have_data = 0;
-		struct timespec t_filter, t_fft, t_render_start, t_render_end;
 
 		pthread_mutex_lock(&ring_mtx);
 		if (ring_read != ring_write) {
@@ -1077,8 +1077,6 @@ int main(int argc, char *argv[])
 		pthread_mutex_unlock(&ring_mtx);
 
 		if (have_data) {
-			clock_gettime(CLOCK_MONOTONIC, &t_filter);
-
 			/* High-pass filter */
 			if (hp_cutoff > 0) {
 				highpass_1pole(ch1_buf, period_frames,
@@ -1116,8 +1114,6 @@ int main(int argc, char *argv[])
 			}
 			wave_filled += (int)period_frames;
 			if (wave_filled > wave_samples) wave_filled = wave_samples;
-
-			clock_gettime(CLOCK_MONOTONIC, &t_fft);
 
 			/* FFT of channel 1 */
 			apply_hann_window(ch1_buf, windowed, fft_size);
@@ -1212,21 +1208,31 @@ int main(int argc, char *argv[])
 				}
 			}
 
-			/* CPU timing: filter stage */
-			{
-				struct timespec now;
-				clock_gettime(CLOCK_MONOTONIC, &now);
-#define TDIFF_US(a,b) ((b.tv_sec-a.tv_sec)*1e6 + (b.tv_nsec-a.tv_nsec)/1e3)
-				float filter_us = TDIFF_US(t_filter, t_fft);
-				float fft_us = TDIFF_US(t_fft, now);
-				avg_filter_us = avg_filter_us * 0.99f + filter_us * 0.01f;
-				avg_fft_us = avg_fft_us * 0.99f + fft_us * 0.01f;
+		}
+
+		/* Poll system CPU usage (~every 30 frames = ~0.5s at 60fps) */
+		if (++cpu_poll_count >= 30) {
+			cpu_poll_count = 0;
+			FILE *sf = fopen("/proc/stat", "r");
+			if (sf) {
+				unsigned long user, nice, sys, idle, iow, irq, sirq, steal;
+				if (fscanf(sf, "cpu %lu %lu %lu %lu %lu %lu %lu %lu",
+					   &user, &nice, &sys, &idle,
+					   &iow, &irq, &sirq, &steal) == 8) {
+					unsigned long total = user + nice + sys + idle +
+							      iow + irq + sirq + steal;
+					unsigned long dt = total - prev_total;
+					unsigned long di = idle - prev_idle;
+					prev_total = total;
+					prev_idle = idle;
+					if (dt > 0)
+						cpu_pct = 100.0f * (1.0f - (float)di / dt);
+				}
+				fclose(sf);
 			}
 		}
 
 		/* ── Render ─────────────────────────────────────────── */
-
-		clock_gettime(CLOCK_MONOTONIC, &t_render_start);
 
 		SDL_SetRenderDrawColor(ren, 15, 15, 20, 255);
 		SDL_RenderClear(ren);
@@ -1461,16 +1467,6 @@ int main(int argc, char *argv[])
 
 		/* On-screen buttons */
 		draw_buttons(ren, WIN_W, WIN_H);
-
-		/* Measure render time BEFORE present (which blocks on vsync) */
-		clock_gettime(CLOCK_MONOTONIC, &t_render_end);
-		{
-			float render_us = TDIFF_US(t_render_start, t_render_end);
-			avg_render_us = avg_render_us * 0.99f + render_us * 0.01f;
-			float budget_us = 1e6f * period_frames / sample_rate;
-			cpu_pct = (avg_filter_us + avg_fft_us + avg_render_us) /
-				  budget_us * 100;
-		}
 
 		SDL_RenderPresent(ren);
 	}

@@ -22,8 +22,9 @@ Window {
     color: "#19191e"
     title: "Launcher"
 
-    /* Base path — students clone embedded-linux into their home dir */
-    readonly property string repo: "/home/linux/embedded-linux"
+    /* Base path — auto-detected from executable location (set by main.cpp),
+     * falls back to ~/embedded-linux for manual launches */
+    readonly property string repo: typeof repoBase !== "undefined" ? repoBase : "/home/linux/embedded-linux"
 
     Item {
         focus: true

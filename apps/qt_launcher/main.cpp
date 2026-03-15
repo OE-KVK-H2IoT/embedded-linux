@@ -318,9 +318,18 @@ int main(int argc, char *argv[])
     LaunchManager launcher(touchMode);
     SystemInfo sysinfo;
 
+    /* Derive repo base path from executable location:
+     * binary is at <repo>/apps/qt_launcher/build/qt_launcher
+     * so repo root = ../../.. relative to the binary's dir.
+     * This lets the same binary work on host and target. */
+    QString repoPath = QDir(QCoreApplication::applicationDirPath()
+                            + "/../../..").canonicalPath();
+    fprintf(stderr, "[launcher] repo path: %s\n", qPrintable(repoPath));
+
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("launcher", &launcher);
     engine.rootContext()->setContextProperty("sysinfo", &sysinfo);
+    engine.rootContext()->setContextProperty("repoBase", repoPath);
     engine.loadFromModule("Launcher", "Main");
 
     if (engine.rootObjects().isEmpty())
