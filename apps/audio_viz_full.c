@@ -429,21 +429,44 @@ static void fx_apply(float *buf, int n, int mode, float *phase)
 	}
 }
 
-/* ── Noise reduction (simple gate + smoothing) ─────────────────────── */
+/* ── Noise reduction (adaptive gate + expander) ────────────────────── */
+
+static float noise_floor_est = 0; /* adaptive noise floor (RMS) */
 
 static void noise_reduce_process(float *buf, int n, float gate_db)
 {
+	(void)gate_db;
 	float rms = 0;
 	for (int i = 0; i < n; i++) rms += buf[i] * buf[i];
 	rms = sqrtf(rms / n);
-	float db = 20.0f * log10f(rms + 1e-10f);
 
-	if (db < gate_db) {
-		/* Below threshold: fade to silence (soft gate) */
-		float atten = (db - gate_db) / 10.0f; /* -10dB fade range */
-		if (atten < -1) atten = -1;
-		float gain_factor = 1.0f + atten; /* 1 at threshold, 0 at -10dB below */
-		if (gain_factor < 0) gain_factor = 0;
+	/* Track noise floor: slowly rises to current RMS, quickly drops.
+	 * This adapts to ambient noise level automatically. */
+	if (rms < noise_floor_est || noise_floor_est < 1e-10f)
+		noise_floor_est = noise_floor_est * 0.95f + rms * 0.05f;
+	else
+		noise_floor_est = noise_floor_est * 0.999f + rms * 0.001f;
+
+	/* Expander: reduce signal that is close to noise floor.
+	 * ratio = how far above noise floor (in dB).
+	 * 0 dB above → full mute, 20 dB above → full volume. */
+	float sig_db = 20.0f * log10f(rms + 1e-10f);
+	float floor_db = 20.0f * log10f(noise_floor_est + 1e-10f);
+	float above_db = sig_db - floor_db;
+
+	float gain_factor;
+	if (above_db < 3.0f) {
+		/* Near or below noise floor — mute */
+		gain_factor = 0;
+	} else if (above_db < 15.0f) {
+		/* Transition zone: 3 to 15 dB above floor */
+		gain_factor = (above_db - 3.0f) / 12.0f;
+	} else {
+		/* Well above noise floor — full volume */
+		gain_factor = 1.0f;
+	}
+
+	if (gain_factor < 1.0f) {
 		for (int i = 0; i < n; i++)
 			buf[i] *= gain_factor;
 	}
@@ -2619,7 +2642,7 @@ int main(int argc, char *argv[])
 			draw_text(ren, stat, right_x, sy, txt_scale);
 			sy += line_h;
 
-			snprintf(stat, sizeof(stat), "Note %s", note_display);
+			snprintf(stat, sizeof(stat), "%-10s", note_display);
 			draw_text(ren, stat, right_x, sy, txt_scale);
 			sy += line_h;
 
@@ -2668,7 +2691,7 @@ int main(int argc, char *argv[])
 				 playback_active ? pipeline_latency_ms : 0.0f,
 				 cpu_pct);
 			snprintf(line2, sizeof(line2),
-				 "Frq %5d Hz  Note %s  Gain %4.1fx",
+				 "Frq %5d Hz  %-10s Gain %4.1fx",
 				 (int)dom_freq_avg, note_display, gain);
 			SDL_SetRenderDrawColor(ren, 140, 160, 180, 255);
 			draw_text(ren, line1, margin, sy, txt_scale);
