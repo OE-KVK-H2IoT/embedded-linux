@@ -412,11 +412,33 @@ static void fx_apply(float *pb1, float *pb2, int n, int nch, int mode)
 		if (nch == 2 && pb2)
 			fx_pitch(pb2, n, 1.5f, fx_hist_r, &fx_rd_r);
 		break;
-	case FX_DEEP:
-		fx_pitch(pb1, n, 0.7f, fx_hist_l, &fx_rd_l);
-		if (nch == 2 && pb2)
-			fx_pitch(pb2, n, 0.7f, fx_hist_r, &fx_rd_r);
+	case FX_DEEP: {
+		/* Stretch in-place: read every 0.6th sample from the
+		 * current block using linear interpolation.  This lowers
+		 * pitch without any buffer drift or delay buildup.
+		 * Works on a copy to avoid aliasing the source. */
+		float tmp[4096];
+		int m = n < 4096 ? n : 4096;
+		memcpy(tmp, pb1, m * sizeof(float));
+		for (int i = 0; i < m; i++) {
+			float pos = i * 0.6f;
+			int i0 = (int)pos;
+			if (i0 >= m - 1) i0 = m - 2;
+			float f = pos - i0;
+			pb1[i] = tmp[i0] * (1.0f - f) + tmp[i0 + 1] * f;
+		}
+		if (nch == 2 && pb2) {
+			memcpy(tmp, pb2, m * sizeof(float));
+			for (int i = 0; i < m; i++) {
+				float pos = i * 0.6f;
+				int i0 = (int)pos;
+				if (i0 >= m - 1) i0 = m - 2;
+				float f = pos - i0;
+				pb2[i] = tmp[i0] * (1.0f - f) + tmp[i0 + 1] * f;
+			}
+		}
 		break;
+	}
 	case FX_ROBOT: {
 		int decimate = 6;
 		float step = 2.0f * M_PI * 80.0f / sample_rate;
