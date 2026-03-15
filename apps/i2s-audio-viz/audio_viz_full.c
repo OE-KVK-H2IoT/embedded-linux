@@ -380,11 +380,11 @@ static void fx_pitch(float *buf, int n, float ratio,
 		while (*rd < 0) *rd += FX_HIST_SIZE;
 	}
 
-	/* Keep read ~0.25s behind write to avoid collision */
+	/* Keep read ~85ms behind write (4096 samples at 48kHz) */
 	float dist = fx_wr - *rd;
 	if (dist < 0) dist += FX_HIST_SIZE;
-	if (dist < 2000 || dist > FX_HIST_SIZE - 2000)
-		*rd = (float)((fx_wr - FX_HIST_SIZE / 4 +
+	if (dist < 1024 || dist > FX_HIST_SIZE - 1024)
+		*rd = (float)((fx_wr - 4096 +
 			       FX_HIST_SIZE) % FX_HIST_SIZE);
 }
 
@@ -400,7 +400,7 @@ static void fx_apply(float *pb1, float *pb2, int n, int nch, int mode)
 
 	/* Init read positions on first call */
 	if (!fx_inited) {
-		fx_rd_l = (float)((fx_wr - FX_HIST_SIZE / 4 +
+		fx_rd_l = (float)((fx_wr - 4096 +
 				    FX_HIST_SIZE) % FX_HIST_SIZE);
 		fx_rd_r = fx_rd_l;
 		fx_inited = 1;
@@ -2299,16 +2299,12 @@ int main(int argc, char *argv[])
 				int pn = period_frames < 4096 ?
 					 (int)period_frames : 4096;
 
-				/* Undo display gain for playback — the mic
-				 * signal was amplified for visualization but
-				 * playback needs a natural level. Target ~0.5
-				 * peak for comfortable listening. */
-				float play_gain = 0.5f / (gain > 1 ? gain : 1);
-				for (int i = 0; i < pn; i++) {
-					pb1[i] = ch1_buf[i] * play_gain;
-					if (channels == 2)
-						pb2[i] = ch2_buf[i] * play_gain;
-				}
+				/* Copy at full gain — I2S mics need the
+				 * amplification, hard clip handles overs */
+				memcpy(pb1, ch1_buf, pn * sizeof(float));
+				if (channels == 2)
+					memcpy(pb2, ch2_buf,
+					       pn * sizeof(float));
 
 				if (noise_reduce) {
 					noise_reduce_process(pb1, pn,
