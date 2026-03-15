@@ -40,7 +40,7 @@
 #define DEFAULT_RATE      48000
 #define DEFAULT_CHANNELS  1
 #define DEFAULT_FRAMES    1024
-#define LOWLAT_FRAMES     256       /* -l: low-latency period size */
+#define LOWLAT_FRAMES     512       /* -l: low-latency period size (10.7ms at 48kHz) */
 #define RING_SLOTS        8         /* capture ring — needs headroom for burst drain */
 
 #define WIN_W             800
@@ -1828,7 +1828,7 @@ static void usage(const char *prog)
 		"  -L Hz       Low-pass cutoff, 0=off (default: %.0f)\n"
 		"  -H Hz       High-pass cutoff (default: %.0f)\n"
 		"  -o DEVICE   ALSA playback device (default: 'default')\n"
-		"  -l          Low-latency mode (256-sample periods for FX)\n"
+		"  -l          Low-latency mode (512-sample periods, may glitch)\n"
 		"  -f          Flip direction 180 deg (mics facing you)\n"
 		"  -h          Show this help\n",
 		prog, DEFAULT_DEVICE, DEFAULT_RATE, DEFAULT_CHANNELS,
