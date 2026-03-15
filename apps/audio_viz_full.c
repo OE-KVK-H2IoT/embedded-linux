@@ -343,60 +343,65 @@ static void delay_process(float *buf, int n, float *dbuf)
 
 /* ── Voice effects (applied to playback copy only) ─────────────────── */
 
-/* Chipmunk: resample up — every N input samples produce N*ratio output.
- * We process blocks: read fewer input samples, interpolate to fill output.
- * Deep: resample down — read more input samples, decimate to fill output.
+/*
+ * Chipmunk: read through input FASTER → output has higher pitch.
+ *   ratio > 1 means we consume more input per output sample.
+ * Deep: read through input SLOWER → output has lower pitch.
+ *   ratio < 1 means we consume less input per output sample.
  *
- * For real-time with fixed block sizes, we use a simple circular buffer
- * with a fractional read pointer. This DOES change speed slightly,
- * but with moderate ratios (1.3x/0.75x) it's barely noticeable for
- * a fun demo. */
+ * Both use a crossfade at the wrap point (last 64 samples blend
+ * with the start) to eliminate the periodic pop/click.
+ */
 
 static float fx_phase_l = 0, fx_phase_r = 0;
 static float fx_robot_phase = 0;  /* ring modulator oscillator */
 
+#define XFADE_LEN 64
+
+static void fx_resample(float *buf, int n, float ratio, float *phase)
+{
+	float tmp[4096];
+	if (n > 4096) n = 4096;
+	memcpy(tmp, buf, n * sizeof(float));
+
+	for (int i = 0; i < n; i++) {
+		float pos = fmodf(*phase, (float)n);
+		int idx0 = (int)pos;
+		int idx1 = (idx0 + 1) % n;
+		float frac = pos - idx0;
+		float sample = tmp[idx0] * (1.0f - frac) + tmp[idx1] * frac;
+
+		/* Crossfade near the wrap point to avoid click */
+		float dist_to_end = (float)n - pos;
+		if (dist_to_end < XFADE_LEN) {
+			float t = dist_to_end / XFADE_LEN; /* 1→0 */
+			/* Blend with sample from the beginning */
+			float wrap_pos = fmodf(pos - (float)n, (float)n);
+			if (wrap_pos < 0) wrap_pos += n;
+			int w0 = (int)wrap_pos;
+			int w1 = (w0 + 1) % n;
+			float wfrac = wrap_pos - w0;
+			float wrap_sample = tmp[w0] * (1.0f - wfrac) +
+					    tmp[w1] * wfrac;
+			sample = sample * t + wrap_sample * (1.0f - t);
+		}
+
+		buf[i] = sample;
+		*phase += ratio;
+	}
+	/* Keep phase bounded to prevent float precision loss */
+	*phase = fmodf(*phase, (float)n);
+}
+
 static void fx_apply(float *buf, int n, int mode, float *phase)
 {
 	switch (mode) {
-	case FX_CHIPMUNK: {
-		/* Resample: read at 0.7x speed → output plays back higher.
-		 * We compress the input in time → higher pitch. */
-		float tmp[4096];
-		if (n > 4096) n = 4096;
-		memcpy(tmp, buf, n * sizeof(float));
-
-		float ratio = 0.65f; /* read slower → output is higher pitch */
-		for (int i = 0; i < n; i++) {
-			int idx0 = (int)*phase;
-			int idx1 = idx0 + 1;
-			if (idx0 >= n) idx0 = n - 1;
-			if (idx1 >= n) idx1 = n - 1;
-			float frac = *phase - (int)*phase;
-			buf[i] = tmp[idx0] * (1.0f - frac) + tmp[idx1] * frac;
-			*phase += ratio;
-		}
-		/* Keep phase in range for next block */
-		*phase = fmodf(*phase, (float)n);
+	case FX_CHIPMUNK:
+		fx_resample(buf, n, 1.6f, phase); /* faster read → higher */
 		break;
-	}
-	case FX_DEEP: {
-		/* Resample: read at 1.5x speed → output plays back lower. */
-		float tmp[4096];
-		if (n > 4096) n = 4096;
-		memcpy(tmp, buf, n * sizeof(float));
-
-		float ratio = 1.6f; /* read faster → output is lower pitch */
-		for (int i = 0; i < n; i++) {
-			float pos = fmodf(*phase, (float)n);
-			int idx0 = (int)pos;
-			int idx1 = (idx0 + 1) % n;
-			float frac = pos - idx0;
-			buf[i] = tmp[idx0] * (1.0f - frac) + tmp[idx1] * frac;
-			*phase += ratio;
-		}
-		*phase = fmodf(*phase, (float)n);
+	case FX_DEEP:
+		fx_resample(buf, n, 0.6f, phase); /* slower read → lower */
 		break;
-	}
 	case FX_ROBOT: {
 		/* Ring modulator: multiply by a sine wave.
 		 * Creates metallic, robotic voice — no pitch shift needed. */
