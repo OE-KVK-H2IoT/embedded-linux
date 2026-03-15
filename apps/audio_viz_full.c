@@ -627,11 +627,11 @@ static void *playback_thread(void *arg)
 	snd_pcm_hw_params_set_rate_near(pcm, hw, &prate, NULL);
 	snd_pcm_hw_params_set_channels(pcm, hw, channels);
 
-	/* Low-latency: use small period + 2 periods buffer */
-	snd_pcm_uframes_t pf = low_latency ? LOWLAT_FRAMES : period_frames;
+	/* Request 3 periods for more slack against scheduling jitter */
+	snd_pcm_uframes_t pf = period_frames;
 	snd_pcm_hw_params_set_period_size_near(pcm, hw, &pf, NULL);
-	unsigned int periods = 2;
-	snd_pcm_hw_params_set_periods_near(pcm, hw, &periods, NULL);
+	unsigned int nperiods = 3;
+	snd_pcm_hw_params_set_periods_near(pcm, hw, &nperiods, NULL);
 
 	if ((err = snd_pcm_hw_params(pcm, hw)) < 0) {
 		fprintf(stderr, "ALSA playback hw_params: %s\n",
@@ -645,29 +645,39 @@ static void *playback_thread(void *arg)
 	snd_pcm_hw_params_get_buffer_size(hw, &buf_size);
 	playback_latency_ms = (float)buf_size / prate * 1000.0f;
 
-	/* SW params: start playback after first period */
+	/* SW params: start playback after filling half the buffer */
 	snd_pcm_sw_params_t *sw;
 	snd_pcm_sw_params_alloca(&sw);
 	snd_pcm_sw_params_current(pcm, sw);
-	snd_pcm_sw_params_set_start_threshold(pcm, sw, pf);
+	snd_pcm_sw_params_set_start_threshold(pcm, sw, buf_size / 2);
 	snd_pcm_sw_params(pcm, sw);
 
-	printf("ALSA playback: %s, %u Hz, %u ch, period %lu, buffer %lu (%.1f ms)\n",
-	       playback_device, prate, channels, pf, buf_size,
-	       playback_latency_ms);
-
-	/* Accumulation buffer: capture period may differ from playback period.
-	 * Collect capture blocks until we have enough for a playback write. */
-	int cap_slot = channels * period_frames; /* samples per capture block */
-	int play_period = (int)pf;               /* playback device period */
-	int acc_size = channels * play_period;
+	int play_period = (int)pf;
+	int play_channels = channels;
+	int acc_frames_needed = play_period; /* frames to accumulate */
+	int acc_size = play_channels * acc_frames_needed * 2; /* 2x for safety */
 	float *acc_buf = calloc(acc_size, sizeof(float));
-	int16_t *out_buf = malloc(acc_size * sizeof(int16_t));
-	int acc_pos = 0; /* how many interleaved samples accumulated */
+	int16_t *out_buf = malloc(play_channels * play_period * sizeof(int16_t));
+	int acc_pos = 0; /* interleaved samples accumulated */
+	int cap_slot = channels * period_frames;
 
-	printf("Playback: accumulating %d-sample capture blocks into "
-	       "%d-sample playback periods\n",
-	       (int)period_frames, play_period);
+	printf("ALSA playback: %s, %u Hz, %u ch, period %d, buffer %lu "
+	       "(%.1f ms), %u periods\n",
+	       playback_device, prate, channels, play_period,
+	       buf_size, playback_latency_ms, nperiods);
+	printf("Playback: cap=%d → play=%d frames "
+	       "(accumulate %d capture blocks per write)\n",
+	       (int)period_frames, play_period,
+	       (play_period + (int)period_frames - 1) / (int)period_frames);
+
+	/* Pre-fill playback buffer with silence to prevent initial underruns */
+	{
+		int16_t *silence = calloc(play_channels * play_period,
+					  sizeof(int16_t));
+		for (unsigned int p = 0; p < nperiods - 1; p++)
+			snd_pcm_writei(pcm, silence, play_period);
+		free(silence);
+	}
 
 	while (running) {
 		/* Wait for data */
@@ -683,19 +693,18 @@ static void *playback_thread(void *arg)
 			pthread_cond_timedwait(&play_cond, &play_mtx, &ts);
 		}
 		if (!running) { pthread_mutex_unlock(&play_mtx); break; }
+
+		/* Copy capture block into accumulation buffer */
 		float *src = play_ring + play_ring_read * cap_slot;
-		/* Copy to accumulation buffer */
-		int to_copy = cap_slot;
-		if (acc_pos + to_copy > acc_size)
-			to_copy = acc_size - acc_pos;
-		memcpy(acc_buf + acc_pos, src, to_copy * sizeof(float));
-		acc_pos += to_copy;
+		memcpy(acc_buf + acc_pos, src, cap_slot * sizeof(float));
+		acc_pos += cap_slot;
 		play_ring_read = (play_ring_read + 1) % PLAY_RING_SLOTS;
 		pthread_mutex_unlock(&play_mtx);
 
-		/* Write to ALSA when we have a full playback period */
-		if (acc_pos >= acc_size) {
-			for (int i = 0; i < acc_size; i++) {
+		/* Write full playback periods, keep leftover */
+		int out_slot = play_channels * play_period;
+		while (acc_pos >= out_slot) {
+			for (int i = 0; i < out_slot; i++) {
 				float s = acc_buf[i];
 				if (s > 1.0f) s = 1.0f;
 				if (s < -1.0f) s = -1.0f;
@@ -709,7 +718,12 @@ static void *playback_thread(void *arg)
 					fprintf(stderr, "ALSA write: %s\n",
 						snd_strerror((int)n));
 			}
-			acc_pos = 0;
+			/* Shift leftover to start */
+			int leftover = acc_pos - out_slot;
+			if (leftover > 0)
+				memmove(acc_buf, acc_buf + out_slot,
+					leftover * sizeof(float));
+			acc_pos = leftover;
 		}
 	}
 
