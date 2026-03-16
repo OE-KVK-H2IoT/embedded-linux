@@ -16,7 +16,7 @@
  * Build:  gcc -Wall -O2 $(sdl2-config --cflags) -o audio_viz_full audio_viz_full.c \
  *           $(sdl2-config --libs) -lasound -lfftw3f -lm -lpthread
  *
- * Run:    ./audio_viz_full -d hw:1,0 -c 2 -m 0.06 -f
+ * Run:    ./audio_viz_full -d hw:1,0 -c 2 -f
  */
 
 #include <stdio.h>
@@ -48,7 +48,7 @@
 #define SPEC_HISTORY      256
 
 #define SPEED_OF_SOUND    343.0f
-#define DEFAULT_MIC_DIST  0.06f
+#define DEFAULT_MIC_DIST  0.08f     /* 8 cm default mic spacing */
 #define DEFAULT_GAIN      4.0f      /* display gain (I2S mics are quiet) */
 #define DEFAULT_WAVE_MS   50
 #define MAX_WAVE_SAMPLES  (48000*2)

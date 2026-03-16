@@ -197,7 +197,7 @@ Window {
                     icon: "\u266B"
                     label: "Audio Viz"
                     accent: "#ff5090"
-                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/i2s-audio-viz/audio_viz -d hw:1,0 -c 2 -m 0.06 -f")
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/i2s-audio-viz/audio_viz -d hw:1,0 -c 2 -f")
                 }
 
                 AppButton {
@@ -206,7 +206,7 @@ Window {
                     icon: "\u266A"
                     label: "Audio Full"
                     accent: "#c050ff"
-                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/i2s-audio-viz/audio_viz_full -d hw:1,0 -c 2 -m 0.06 -f")
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/i2s-audio-viz/audio_viz_full -d hw:1,0 -c 2 -f")
                 }
             }
         }

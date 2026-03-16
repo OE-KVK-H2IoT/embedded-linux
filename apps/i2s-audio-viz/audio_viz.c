@@ -43,7 +43,7 @@
 #define SPEC_HISTORY      256       /* spectrogram scroll columns */
 
 #define SPEED_OF_SOUND    343.0f    /* m/s */
-#define DEFAULT_MIC_DIST  0.06f     /* 6 cm default mic spacing */
+#define DEFAULT_MIC_DIST  0.08f     /* 8 cm default mic spacing */
 #define DEFAULT_GAIN      4.0f      /* software gain (I2S mics are often quiet) */
 #define DEFAULT_WAVE_MS   50        /* waveform display length in ms */
 #define MAX_WAVE_SAMPLES  (48000*2) /* max 2 seconds of waveform history */
