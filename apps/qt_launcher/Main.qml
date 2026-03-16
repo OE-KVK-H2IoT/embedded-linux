@@ -123,7 +123,7 @@ Window {
                     icon: "\u25A3"
                     label: "Pong"
                     accent: "#c878ff"
-                    onClicked: launcher.launch(repo + "/apps/pong_fb")
+                    onClicked: launcher.launch(repo + "/apps/pong-fb/pong_fb")
                 }
             }
         }
@@ -161,7 +161,7 @@ Window {
                     icon: "\u25CE"
                     label: "Level"
                     accent: "#50e0a0"
-                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/level_sdl2")
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/level-display/level_sdl2")
                 }
 
                 AppButton {
@@ -170,7 +170,7 @@ Window {
                     icon: "\u2261"
                     label: "SDL2 Dash"
                     accent: "#50b4ff"
-                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/sdl2_dashboard")
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/sdl2-dashboard/sdl2_dashboard")
                 }
 
                 AppButton {
@@ -197,7 +197,7 @@ Window {
                     icon: "\u266B"
                     label: "Audio Viz"
                     accent: "#ff5090"
-                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/audio_viz -d hw:1,0 -c 2 -m 0.06 -f")
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/i2s-audio-viz/audio_viz -d hw:1,0 -c 2 -m 0.06 -f")
                 }
 
                 AppButton {
@@ -206,7 +206,7 @@ Window {
                     icon: "\u266A"
                     label: "Audio Full"
                     accent: "#c050ff"
-                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/audio_viz_full -d hw:1,0 -c 2 -m 0.06 -f")
+                    onClicked: launcher.launch("SDL_VIDEODRIVER=kmsdrm " + repo + "/apps/i2s-audio-viz/audio_viz_full -d hw:1,0 -c 2 -m 0.06 -f")
                 }
             }
         }
