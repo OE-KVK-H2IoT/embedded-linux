@@ -2,159 +2,199 @@
 """Train keystroke classifier from collected audio data.
 
 Usage:
-    python train_model.py                      # use default keystroke_data/
-    python train_model.py path/to/data_dir     # specify data directory
+    python train_model.py                          # default keystroke_data/
+    python train_model.py path/to/data_dir         # specify data directory
+    python train_model.py --augment                # enable data augmentation
+    python train_model.py --model svm              # use SVM instead of RF
 """
 
-import sys
+import argparse
 import pickle
 import numpy as np
 from pathlib import Path
-from scipy.fft import rfft
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.metrics import confusion_matrix, classification_report
 
-RATE = 48000
-
-
-# ── Onset detection ─────────────────────────────────────────────────
-
-def detect_onsets(audio, rate, threshold=3.0, min_gap_ms=200):
-    """Find keystroke onset positions using energy ratio."""
-    frame_ms = 5
-    frame_len = int(rate * frame_ms / 1000)
-    hop = frame_len // 2
-
-    # Short-term energy
-    energy = []
-    for i in range(0, len(audio) - frame_len, hop):
-        e = np.sum(audio[i:i + frame_len] ** 2)
-        energy.append(e)
-    energy = np.array(energy)
-
-    # Running average (100ms window)
-    avg_len = int(100 / frame_ms)
-    avg = np.convolve(energy, np.ones(avg_len) / avg_len, mode='same')
-
-    # Find peaks where energy exceeds threshold * average
-    ratio = energy / (avg + 1e-10)
-    peaks = np.where(ratio > threshold)[0]
-
-    # Merge nearby peaks (min_gap)
-    min_gap = int(min_gap_ms / frame_ms * 2)
-    onsets = []
-    last = -min_gap
-    for p in peaks:
-        if p - last >= min_gap:
-            onsets.append(p * hop)
-            last = p
-
-    return onsets
-
-
-# ── Feature extraction ──────────────────────────────────────────────
-
-def extract_features(audio, onset, rate, window_ms=80, n_mels=40):
-    """Extract mel-spectrogram features from a keystroke."""
-    window = int(rate * window_ms / 1000)
-    segment = audio[onset:onset + window]
-    if len(segment) < window:
-        segment = np.pad(segment, (0, window - len(segment)))
-
-    # STFT: 4ms frames, 2ms hop
-    frame_len = int(rate * 0.004)
-    hop = frame_len // 2
-    n_frames = (window - frame_len) // hop + 1
-
-    spec = np.zeros((frame_len // 2 + 1, n_frames))
-    for i in range(n_frames):
-        frame = segment[i * hop: i * hop + frame_len]
-        frame = frame * np.hanning(len(frame))
-        fft = np.abs(rfft(frame))
-        spec[:, i] = 20 * np.log10(fft + 1e-10)
-
-    # Mel-scale binning (simplified: log-spaced frequency bins)
-    freq_bins = spec.shape[0]
-    mel_bins = np.logspace(np.log10(1), np.log10(freq_bins), n_mels + 1,
-                           dtype=int)
-    mel_spec = np.zeros((n_mels, n_frames))
-    for m in range(n_mels):
-        lo, hi = mel_bins[m], mel_bins[m + 1]
-        if hi <= lo:
-            hi = lo + 1
-        mel_spec[m, :] = np.mean(spec[lo:hi, :], axis=0)
-
-    return mel_spec.flatten()  # fixed-length feature vector
+from features import (RATE, extract_features, detect_onsets,
+                       extract_keystroke_segment)
 
 
 # ── Dataset builder ─────────────────────────────────────────────────
 
-def build_dataset(data_dir):
-    """Load all recorded keys, detect onsets, extract features."""
+def build_dataset(data_dir, augment=False):
+    """Load training data from both formats:
+    - Old format: key_*.npy files (one per key, onset detection)
+    - New format: round_*.npy + labels.npz (typing practice, timestamped)
+    """
     data_dir = Path(data_dir)
     X, y = [], []
 
-    for npy_file in sorted(data_dir.glob("key_*.npy")):
-        label = npy_file.stem.replace("key_", "")
-        audio = np.load(npy_file)
+    # ── New format: typing practice rounds with timestamps ───────
+    labels_path = data_dir / 'labels.npz'
+    if labels_path.exists():
+        labels = np.load(labels_path, allow_pickle=True)
+        keys = labels['keys']
+        samples = labels['samples']
+        correct = labels['correct']
 
-        onsets = detect_onsets(audio, RATE)
-        print(f"  {label}: {len(onsets)} keystrokes detected")
+        # Load all round audio files
+        round_files = sorted(data_dir.glob("round_*.npy"))
+        if round_files:
+            print(f"  Loading {len(round_files)} practice rounds...")
+            rounds = []
+            round_lengths = []
+            for rf in round_files:
+                audio = np.load(rf)
+                rounds.append(audio)
+                round_lengths.append(len(audio))
 
-        for onset in onsets:
-            features = extract_features(audio, onset, RATE)
-            X.append(features)
-            y.append(label)
+            # Concatenate all rounds into one long audio stream
+            full_audio = np.concatenate(rounds)
+
+            # Extract segments at each labeled timestamp
+            n_used = 0
+            n_skipped = 0
+            for key, sample_pos, is_correct in zip(keys, samples, correct):
+                if not is_correct:
+                    n_skipped += 1
+                    continue
+                if sample_pos >= len(full_audio):
+                    n_skipped += 1
+                    continue
+
+                segment = extract_keystroke_segment(
+                    full_audio, int(sample_pos))
+                features = extract_features(segment)
+                label = key if key != ' ' else 'space'
+                X.append(features)
+                y.append(label)
+                n_used += 1
+
+                if augment:
+                    for aug_seg in augment_segment(segment):
+                        X.append(extract_features(aug_seg))
+                        y.append(label)
+
+            print(f"  Practice data: {n_used} keystrokes used, "
+                  f"{n_skipped} skipped (mistyped/oob)")
+
+    # ── Old format: per-key recordings with onset detection ──────
+    key_files = sorted(data_dir.glob("key_*.npy"))
+    if key_files:
+        print(f"  Loading {len(key_files)} per-key recordings...")
+        for npy_file in key_files:
+            label = npy_file.stem.replace("key_", "")
+            audio = np.load(npy_file)
+
+            onsets = detect_onsets(audio, RATE)
+            print(f"    {label}: {len(onsets)} keystrokes detected")
+
+            for onset in onsets:
+                segment = extract_keystroke_segment(audio, onset)
+                features = extract_features(segment)
+                X.append(features)
+                y.append(label)
+
+                if augment:
+                    for aug_seg in augment_segment(segment):
+                        X.append(extract_features(aug_seg))
+                        y.append(label)
 
     return np.array(X), np.array(y)
 
 
-# ── Data augmentation ───────────────────────────────────────────────
-
-def augment(segment, rate):
+def augment_segment(segment):
     """Create augmented copies of a keystroke segment."""
-    augmented = [segment]  # original
+    augmented = []
+    rate = RATE
 
-    # Time shift: +/- 5ms
-    shift = int(rate * 0.005)
+    # Time shift: +/- 3ms
+    shift = int(rate * 0.003)
     augmented.append(np.roll(segment, shift))
     augmented.append(np.roll(segment, -shift))
 
     # Add slight noise
-    noise = np.random.randn(len(segment)) * 0.001
+    noise = np.random.randn(len(segment)) * 0.002
     augmented.append(segment + noise)
 
-    # Slight gain variation (+/- 10%)
-    augmented.append(segment * 1.1)
-    augmented.append(segment * 0.9)
+    # Slight gain variation (+/- 15%)
+    augmented.append(segment * 1.15)
+    augmented.append(segment * 0.85)
 
     return augmented
 
 
 # ── Main ────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    data_dir = sys.argv[1] if len(sys.argv) > 1 else "keystroke_data"
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train keystroke classifier")
+    parser.add_argument('data_dir', nargs='?', default='keystroke_data',
+                        help='Training data directory')
+    parser.add_argument('--model', choices=['rf', 'svm'], default='svm',
+                        help='Classifier: rf (Random Forest) or svm (default)')
+    parser.add_argument('--augment', action='store_true',
+                        help='Enable data augmentation (5x more samples)')
+    parser.add_argument('--output', default='keystroke_model.pkl',
+                        help='Output model path')
+    args = parser.parse_args()
 
-    print(f"Loading data from {data_dir}/ ...")
-    X, y = build_dataset(data_dir)
-    print(f"Dataset: {len(X)} samples, {len(set(y))} classes\n")
+    print(f"Loading data from {args.data_dir}/ ...")
+    X, y = build_dataset(args.data_dir, augment=args.augment)
+    print(f"Dataset: {len(X)} samples, {len(set(y))} classes, "
+          f"{X.shape[1]} features\n")
 
-    # Train with cross-validation
+    # Build pipeline
+    if args.model == 'svm':
+        clf = SVC(kernel='rbf', C=10, gamma='scale', probability=True,
+                  random_state=42)
+        name = "SVM (RBF)"
+    else:
+        clf = RandomForestClassifier(n_estimators=200, random_state=42,
+                                     max_depth=None, min_samples_leaf=1)
+        name = "Random Forest"
+
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
-        ("clf", RandomForestClassifier(n_estimators=100, random_state=42))
+        ("clf", clf)
     ])
 
+    # Cross-validation
     scores = cross_val_score(pipeline, X, y, cv=5, scoring="accuracy")
-    print(f"Cross-validation accuracy: {scores.mean():.1%} (+/- {scores.std():.1%})")
+    print(f"{name} cross-validation: {scores.mean():.1%} "
+          f"(+/- {scores.std():.1%})")
 
     # Train final model on all data
     pipeline.fit(X, y)
 
-    # Save model
-    with open("keystroke_model.pkl", "wb") as f:
+    # Show confusion info
+    y_pred = pipeline.predict(X)
+    print(f"\nTraining accuracy: {np.mean(y_pred == y):.1%}")
+
+    # Find most confused pairs
+    labels = sorted(set(y))
+    cm = confusion_matrix(y, y_pred, labels=labels)
+    np.fill_diagonal(cm, 0)
+    worst = []
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            if cm[i, j] > 0:
+                worst.append((cm[i, j], labels[i], labels[j]))
+    worst.sort(reverse=True)
+    if worst:
+        print("\nMost confused pairs (true → predicted):")
+        for count, true, pred in worst[:5]:
+            print(f"  {true} → {pred}: {count}x")
+
+    # Save
+    with open(args.output, "wb") as f:
         pickle.dump(pipeline, f)
-    print("Model saved to keystroke_model.pkl")
+    print(f"\nModel saved to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
