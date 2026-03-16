@@ -1900,13 +1900,66 @@ static void draw_text(SDL_Renderer *r, const char *str,
 
 static void handle_signal(int sig) { (void)sig; running = 0; }
 
+/* ── List ALSA devices ──────────────────────────────────────────────── */
+
+static void list_alsa_devices(void)
+{
+	printf("ALSA capture devices:\n");
+	void **hints;
+	if (snd_device_name_hint(-1, "pcm", &hints) < 0) {
+		fprintf(stderr, "  (could not enumerate)\n");
+		return;
+	}
+	for (void **h = hints; *h; h++) {
+		char *name = snd_device_name_get_hint(*h, "NAME");
+		char *desc = snd_device_name_get_hint(*h, "DESC");
+		char *ioid = snd_device_name_get_hint(*h, "IOID");
+
+		/* Show capture-capable devices (IOID=NULL means both) */
+		if (!ioid || strcmp(ioid, "Input") == 0) {
+			printf("  %-20s", name ? name : "?");
+			if (desc) {
+				/* Print first line of description */
+				char *nl = strchr(desc, '\n');
+				if (nl) *nl = '\0';
+				printf("  %s", desc);
+			}
+			printf("\n");
+		}
+		free(name); free(desc); free(ioid);
+	}
+	snd_device_name_free_hint(hints);
+
+	printf("\nALSA playback devices:\n");
+	if (snd_device_name_hint(-1, "pcm", &hints) < 0) return;
+	for (void **h = hints; *h; h++) {
+		char *name = snd_device_name_get_hint(*h, "NAME");
+		char *desc = snd_device_name_get_hint(*h, "DESC");
+		char *ioid = snd_device_name_get_hint(*h, "IOID");
+
+		if (!ioid || strcmp(ioid, "Output") == 0) {
+			printf("  %-20s", name ? name : "?");
+			if (desc) {
+				char *nl = strchr(desc, '\n');
+				if (nl) *nl = '\0';
+				printf("  %s", desc);
+			}
+			printf("\n");
+		}
+		free(name); free(desc); free(ioid);
+	}
+	snd_device_name_free_hint(hints);
+}
+
 /* ── Usage ──────────────────────────────────────────────────────────── */
 
 static void usage(const char *prog)
 {
 	fprintf(stderr,
 		"Usage: %s [options]\n"
-		"  -d DEVICE   ALSA device (default: %s)\n"
+		"  -d DEVICE   ALSA capture device (default: %s)\n"
+		"  -o DEVICE   ALSA playback device (default: 'default')\n"
+		"  -D          List available ALSA devices and exit\n"
 		"  -r RATE     Sample rate (default: %u)\n"
 		"  -c CHANS    Channels: 1 or 2 (default: %u)\n"
 		"  -n FRAMES   Period/FFT size (default: %lu)\n"
@@ -1916,8 +1969,7 @@ static void usage(const char *prog)
 		"  -T dB       Noise gate threshold (default: %.0f dB)\n"
 		"  -L Hz       Low-pass cutoff, 0=off (default: %.0f)\n"
 		"  -H Hz       High-pass cutoff (default: %.0f)\n"
-		"  -o DEVICE   ALSA playback device (default: 'default')\n"
-		"  -l          Low-latency mode (512-sample periods, may glitch)\n"
+		"  -l          Low-latency mode (512-sample periods)\n"
 		"  -f          Flip direction 180 deg (mics facing you)\n"
 		"  -h          Show this help\n",
 		prog, DEFAULT_DEVICE, DEFAULT_RATE, DEFAULT_CHANNELS,
@@ -1931,7 +1983,7 @@ static void usage(const char *prog)
 int main(int argc, char *argv[])
 {
 	int opt;
-	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:T:L:H:o:lfh")) != -1) {
+	while ((opt = getopt(argc, argv, "d:r:c:n:g:w:m:T:L:H:o:Dlfh")) != -1) {
 		switch (opt) {
 		case 'd': alsa_device = optarg; break;
 		case 'r': sample_rate = atoi(optarg); break;
@@ -1944,6 +1996,7 @@ int main(int argc, char *argv[])
 		case 'L': lp_cutoff = atof(optarg); break;
 		case 'H': hp_cutoff = atof(optarg); break;
 		case 'o': playback_device = optarg; break;
+		case 'D': list_alsa_devices(); return 0;
 		case 'l': low_latency = 1; break;
 		case 'f': flip_dir = 1; break;
 		default: usage(argv[0]); return opt == 'h' ? 0 : 1;
@@ -2176,13 +2229,43 @@ int main(int argc, char *argv[])
 					break;
 				}
 			}
-			/* Touch: track start position for tap vs swipe */
+			/* ── Unified touch + mouse input ──────────────── */
+			/* Convert mouse events to normalized 0.0-1.0 coords
+			 * so both mouse and touch use the same logic. */
+			float nx = -1, ny = -1;  /* normalized coords */
+			int is_down = 0, is_up = 0, is_motion = 0;
+
 			if (ev.type == SDL_FINGERDOWN) {
-				touch_start_y = ev.tfinger.y;
+				nx = ev.tfinger.x; ny = ev.tfinger.y;
+				is_down = 1;
+			} else if (ev.type == SDL_FINGERMOTION) {
+				nx = ev.tfinger.x; ny = ev.tfinger.y;
+				is_motion = 1;
+			} else if (ev.type == SDL_FINGERUP) {
+				nx = ev.tfinger.x; ny = ev.tfinger.y;
+				is_up = 1;
+			} else if (ev.type == SDL_MOUSEBUTTONDOWN &&
+				   ev.button.button == SDL_BUTTON_LEFT) {
+				nx = (float)ev.button.x / WIN_W;
+				ny = (float)ev.button.y / WIN_H;
+				is_down = 1;
+			} else if (ev.type == SDL_MOUSEMOTION &&
+				   (ev.motion.state & SDL_BUTTON_LMASK)) {
+				nx = (float)ev.motion.x / WIN_W;
+				ny = (float)ev.motion.y / WIN_H;
+				is_motion = 1;
+			} else if (ev.type == SDL_MOUSEBUTTONUP &&
+				   ev.button.button == SDL_BUTTON_LEFT) {
+				nx = (float)ev.button.x / WIN_W;
+				ny = (float)ev.button.y / WIN_H;
+				is_up = 1;
+			}
+
+			if (is_down) {
+				touch_start_y = ny;
 				/* Close button on active overlay */
 				if ((eq_overlay || tdoa_overlay) &&
-				    close_button_hit(ev.tfinger.x,
-						     ev.tfinger.y,
+				    close_button_hit(nx, ny,
 						     WIN_W, WIN_H)) {
 					if (eq_overlay) {
 						eq_overlay = 0;
@@ -2194,35 +2277,30 @@ int main(int argc, char *argv[])
 					}
 				} else if (eq_overlay) {
 					int hit = eq_hit_test(
-						ev.tfinger.x, ev.tfinger.y,
-						WIN_W, WIN_H);
+						nx, ny, WIN_W, WIN_H);
 					if (hit >= EQ_HIT_PITCH_BASE) {
-						/* FX preset button */
 						int pi = hit - EQ_HIT_PITCH_BASE;
 						if (pi >= 0 && pi < FX_COUNT)
 							fx_mode = pi;
 					} else if (hit >= 0) {
 						eq_dragging = hit;
-						eq_drag_update(ev.tfinger.y,
-							       WIN_H);
+						eq_drag_update(ny, WIN_H);
 					}
 				}
-				if (ev.tfinger.y > 0.85f && eq_dragging < 0)
+				if (ny > 0.85f && eq_dragging < 0)
 					swipe_active = 1;
 			}
-			if (ev.type == SDL_FINGERMOTION) {
+			if (is_motion) {
 				if (eq_dragging >= 0)
-					eq_drag_update(ev.tfinger.y, WIN_H);
-				else if (swipe_active && ev.tfinger.y < 0.5f)
+					eq_drag_update(ny, WIN_H);
+				else if (swipe_active && ny < 0.5f)
 					running = 0;
 			}
-			if (ev.type == SDL_FINGERUP) {
-				/* Tap = finger didn't travel far */
-				float dy = fabsf(ev.tfinger.y - touch_start_y);
+			if (is_up) {
+				float dy = fabsf(ny - touch_start_y);
 				if (dy < 0.05f) {
 					int btn = hit_test_button(
-						ev.tfinger.x, ev.tfinger.y,
-						WIN_H);
+						nx, ny, WIN_H);
 					if (btn == 0) {
 						if (recording)
 							wav_stop();
