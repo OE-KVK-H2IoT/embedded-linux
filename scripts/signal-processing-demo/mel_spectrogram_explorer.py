@@ -34,7 +34,20 @@ def mel_to_hz(m):
 
 
 def make_mel_filterbank(n_mels, n_fft, fs, f_min=100, f_max=12000):
-    """Create triangular mel filterbank matrix."""
+    """Create triangular mel filterbank matrix.
+
+    KNOWN ISSUE: when n_mels is large relative to n_fft/2, upper
+    mel triangles collapse to zero width (adjacent center frequencies
+    map to the same FFT bin).  These bands produce zero energy →
+    black lines in the spectrogram.
+
+    This is NOT a bug — it's a fundamental constraint:
+      max useful mel bands ≈ n_fft / 8 to n_fft / 4
+      (e.g., FFT=512 → max ~64 useful mel bands,
+       FFT=256 → max ~32, FFT=128 → max ~16)
+
+    Fix: increase FFT size to get more frequency bins.
+    """
     mel_min = hz_to_mel(f_min)
     mel_max = hz_to_mel(f_max)
     mel_points = np.linspace(mel_min, mel_max, n_mels + 2)
@@ -42,12 +55,19 @@ def make_mel_filterbank(n_mels, n_fft, fs, f_min=100, f_max=12000):
 
     bin_points = np.round(hz_points / fs * n_fft).astype(int)
     n_bins = n_fft // 2 + 1
+    bin_points = np.clip(bin_points, 0, n_bins - 1)
+
     fb = np.zeros((n_mels, n_bins))
+    n_empty = 0
 
     for m in range(n_mels):
         left = bin_points[m]
         center = bin_points[m + 1]
         right = bin_points[m + 2]
+
+        # Count degenerate (zero-width) triangles
+        if left == center or center == right:
+            n_empty += 1
 
         for k in range(left, center):
             if center > left:
@@ -55,6 +75,11 @@ def make_mel_filterbank(n_mels, n_fft, fs, f_min=100, f_max=12000):
         for k in range(center, right):
             if right > center:
                 fb[m, k] = (right - k) / (right - center)
+
+    if n_empty > 0:
+        print(f"  Warning: {n_empty}/{n_mels} mel bands have zero-width "
+              f"triangles (FFT has only {n_bins} bins for {n_mels} bands). "
+              f"Increase FFT size to fix.")
 
     return fb, hz_points
 
@@ -262,20 +287,39 @@ def interactive_demo():
         axes[1][0].set_xlabel('Time (ms)')
         axes[1][0].set_ylabel('Mel band')
 
-        # Info
+        # Info panel
         freq_res = fs / n_fft
         time_res = hop / fs * 1000
+        n_bins = n_fft // 2 + 1
         axes[1][1].axis('off')
+
+        # Count empty mel filters (zero-width triangles)
+        n_empty = 0
+        for m in range(n_mels):
+            if np.sum(fb[m, :]) < 1e-10:
+                n_empty += 1
+
         info = (f"FFT size: {n_fft} samples\n"
+                f"Freq bins: {n_bins}\n"
                 f"Frequency resolution: {freq_res:.1f} Hz/bin\n"
                 f"Hop size: {hop} samples\n"
                 f"Time resolution: {time_res:.1f} ms/frame\n"
                 f"Mel bands: {n_mels}\n"
                 f"Feature vector: {n_mels} × {spec.shape[1]} "
                 f"= {n_mels * spec.shape[1]} values")
-        axes[1][1].text(0.1, 0.5, info, fontsize=13, fontfamily='monospace',
-                        transform=axes[1][1].transAxes, verticalalignment='center')
-        axes[1][1].set_title('Parameters')
+
+        if n_empty > 0:
+            info += (f"\n\n⚠ {n_empty} EMPTY mel bands!\n"
+                     f"Only {n_bins} FFT bins for {n_mels} bands.\n"
+                     f"Upper mel triangles have zero width\n"
+                     f"→ black lines in spectrogram.\n"
+                     f"Fix: increase FFT size to {n_mels * 8}+")
+
+        axes[1][1].text(0.05, 0.5, info, fontsize=11, fontfamily='monospace',
+                        transform=axes[1][1].transAxes, verticalalignment='center',
+                        color='red' if n_empty > 0 else 'black')
+        axes[1][1].set_title('Parameters' if n_empty == 0
+                             else '⚠ Parameters — resolution mismatch!')
 
         fig.canvas.draw_idle()
 
