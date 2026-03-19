@@ -28,7 +28,7 @@ try:
     from sklearn.neighbors import KNeighborsClassifier
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import train_test_split
-    from sklearn.datasets import make_classification
+    from sklearn.datasets import make_blobs
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
@@ -39,14 +39,11 @@ def make_keystroke_data(n_samples=200, n_classes=5, separation=1.0,
                         random_state=42):
     """Generate 2D data that mimics keystroke feature distributions.
     Each class = one key, features = 2 most important mel bands."""
-    X, y = make_classification(
+    X, y = make_blobs(
         n_samples=n_samples,
         n_features=2,
-        n_informative=2,
-        n_redundant=0,
-        n_classes=n_classes,
-        n_clusters_per_class=1,
-        class_sep=separation,
+        centers=n_classes,
+        cluster_std=1.0 / separation,
         random_state=random_state,
     )
     return X, y
